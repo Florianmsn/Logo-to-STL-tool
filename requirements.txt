@@ -1,0 +1,6 @@
+pillow
+numpy
+opencv-python
+shapely>=2.1.0
+trimesh
+pyinstaller
