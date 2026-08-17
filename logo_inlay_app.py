@@ -20,7 +20,7 @@ except ImportError:
     from logo_inlay_core import closest_color_name as guess_color_name
 
 
-APP_TITLE = "Logo Inlay Tool 7.5"
+APP_TITLE = "Logo Inlay Tool 7.6"
 MANUAL_AUTO_LABEL = -2147483000
 APP_DIR = Path.home() / ".logo_inlay_tool"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -224,13 +224,70 @@ class ScrollFrame(ttk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
         self.canvas = tk.Canvas(self, highlightthickness=0)
-        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollbar = ttk.Scrollbar(
+            self, orient="vertical", command=self.canvas.yview
+        )
         self.inner = ttk.Frame(self.canvas)
-        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.window_id = self.canvas.create_window(
+            (0, 0), window=self.inner, anchor="nw"
+        )
+
+        self.inner.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(
+                scrollregion=self.canvas.bbox("all")
+            )
+        )
+        self.canvas.bind("<Configure>", self._canvas_resized)
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
+
+        self._bind_mousewheel(self.canvas)
+        self._bind_mousewheel(self.inner)
+
+    def _canvas_resized(self, event):
+        try:
+            self.canvas.itemconfigure(self.window_id, width=event.width)
+        except Exception:
+            pass
+
+    def _on_mousewheel(self, event):
+        if getattr(event, "num", None) == 4:
+            steps = -1
+        elif getattr(event, "num", None) == 5:
+            steps = 1
+        else:
+            delta = getattr(event, "delta", 0)
+            if delta == 0:
+                return "break"
+            steps = (
+                -int(delta / 120)
+                if abs(delta) >= 120
+                else (-1 if delta > 0 else 1)
+            )
+
+        self.canvas.yview_scroll(steps, "units")
+        return "break"
+
+    def _bind_mousewheel(self, widget):
+        try:
+            widget.bind("<MouseWheel>", self._on_mousewheel, add="+")
+            widget.bind("<Button-4>", self._on_mousewheel, add="+")
+            widget.bind("<Button-5>", self._on_mousewheel, add="+")
+        except Exception:
+            pass
+
+    def bind_mousewheel_recursive(self, widget=None):
+        """Allow wheel scrolling even when the pointer is over child controls."""
+        widget = widget or self.inner
+        self._bind_mousewheel(widget)
+        try:
+            for child in widget.winfo_children():
+                self.bind_mousewheel_recursive(child)
+        except Exception:
+            pass
 
 
 
@@ -385,6 +442,9 @@ class App(tk.Tk):
         self.preview_photo = None
         self.original_preview_photo = None
         self.deckel_photo = None
+        self._preview_source_image = None
+        self._preview_resize_job = None
+        self._edit_divider_dragging = False
 
         # V6 manual editor state
         self.manual_label_img = None
@@ -526,10 +586,12 @@ class App(tk.Tk):
         ttk.Label(bottom, textvariable=self.status).pack(anchor="w")
 
     def build_left(self, parent):
-        root = ttk.Frame(parent)
-        root.pack(fill="both", expand=True)
+        self.left_scroll = ScrollFrame(parent)
+        self.left_scroll.pack(fill="both", expand=True)
+        root = self.left_scroll.inner
 
         file_sec = CollapsibleFrame(root, "File & Export", expanded=True)
+        self.file_section = file_sec
         file_sec.pack(fill="x", pady=(0, 6))
         file_box = file_sec.body
         row = ttk.Frame(file_box)
@@ -542,7 +604,8 @@ class App(tk.Tk):
         ttk.Entry(outrow, textvariable=self.out_dir).pack(side="left", fill="x", expand=True)
         ttk.Button(outrow, text="Folder", command=self.choose_out, width=8).pack(side="right", padx=(5, 0))
 
-        prof_sec = CollapsibleFrame(root, "Profile", expanded=True)
+        prof_sec = CollapsibleFrame(root, "Profile", expanded=False)
+        self.profile_section = prof_sec
         prof_sec.pack(fill="x", pady=(0, 6))
         prof = prof_sec.body
         prow = ttk.Frame(prof)
@@ -557,6 +620,7 @@ class App(tk.Tk):
         ttk.Button(prow, text="Save", command=self.save_profile_as, width=9).pack(side="left")
 
         std_sec = CollapsibleFrame(root, "Logo & Analysis", expanded=True)
+        self.logo_analysis_section = std_sec
         std_sec.pack(fill="x", pady=(0, 6))
         std = std_sec.body
         self.row_entry(std, "Logo Width (mm)", self.target_w, TIP["target"])
@@ -568,14 +632,16 @@ class App(tk.Tk):
         ttk.Button(brow, text="(Start) Analyze Colors", command=self.start_analyze).pack(side="left", fill="x", expand=True, padx=(0, 3))
         ttk.Button(brow, text="(Finish) Generate STLs", command=self.start_generate).pack(side="left", fill="x", expand=True, padx=(3, 0))
 
-        geo_sec = CollapsibleFrame(root, "Target Surface & Fit", expanded=True)
+        geo_sec = CollapsibleFrame(root, "Target Surface & Fit", expanded=False)
+        self.target_surface_section = geo_sec
         geo_sec.pack(fill="x", pady=(0, 6))
         geo = geo_sec.body
         self.row_entry(geo, "Part Height (mm)", self.height, TIP["height"])
         self.row_entry(geo, "Cutout Depth (mm)", self.cut, TIP["cut"])
         self.row_entry(geo, "Clearance (mm)", self.clearance, TIP["clearance"])
 
-        quality_sec = CollapsibleFrame(root, "Geometry Quality", expanded=True)
+        quality_sec = CollapsibleFrame(root, "Geometry Quality", expanded=False)
+        self.geometry_quality_section = quality_sec
         quality_sec.pack(fill="x", pady=(0, 6))
         quality = quality_sec.body
 
@@ -622,7 +688,8 @@ class App(tk.Tk):
             command=self.apply_geometry_settings
         ).pack(fill="x", pady=(7, 0))
 
-        analysis_sec = CollapsibleFrame(root, "Color Analysis", expanded=False)
+        analysis_sec = CollapsibleFrame(root, "Color Analysis", expanded=True)
+        self.color_analysis_section = analysis_sec
         analysis_sec.pack(fill="x", pady=(0, 6))
         adv = analysis_sec.body
         self.row_entry(
@@ -651,6 +718,9 @@ class App(tk.Tk):
             text="These settings change color detection. Click (Start) Analyze Colors to apply them.",
             wraplength=330
         ).pack(fill="x", pady=(6, 0))
+        # Bind after all child widgets exist, so the wheel works over entries,
+        # buttons, combo boxes, labels and section headers as well.
+        self.left_scroll.bind_mousewheel_recursive(root)
 
 
     def build_right(self, parent):
@@ -714,13 +784,23 @@ class App(tk.Tk):
 
         # Movable vertical splitter: drag the divider to give more space either
         # to the logo preview or to the detected-color list.
-        self.edit_paned = ttk.Panedwindow(self.tab_edit, orient="vertical")
+        self.edit_paned = tk.PanedWindow(
+            self.tab_edit,
+            orient=tk.VERTICAL,
+            sashwidth=10,
+            sashrelief=tk.RAISED,
+            showhandle=True,
+            handlesize=12,
+            handlepad=4,
+            bd=0,
+            relief=tk.FLAT,
+        )
         self.edit_paned.pack(fill="both", expand=True)
 
         preview_pane = ttk.Frame(self.edit_paned)
         colors_pane = ttk.Frame(self.edit_paned)
-        self.edit_paned.add(preview_pane, weight=3)
-        self.edit_paned.add(colors_pane, weight=2)
+        self.edit_paned.add(preview_pane, minsize=90, stretch="always")
+        self.edit_paned.add(colors_pane, minsize=145, stretch="always")
 
         preview_box = ttk.LabelFrame(
             preview_pane, text="Preview & Highlight", padding=8
@@ -728,6 +808,24 @@ class App(tk.Tk):
         preview_box.pack(fill="both", expand=True)
         self.preview = ttk.Label(preview_box, relief="groove", anchor="center")
         self.preview.pack(fill="both", expand=True)
+        self.preview.bind("<Configure>", self._schedule_preview_resize)
+
+        # A visible grip makes it obvious that the lower color area can be
+        # pulled upward. The grip itself is draggable, in addition to the sash.
+        self.edit_grip = tk.Label(
+            colors_pane,
+            text="↕   DRAG TO RESIZE PREVIEW / COLORS   ↕",
+            cursor="sb_v_double_arrow",
+            relief=tk.RIDGE,
+            bd=1,
+            pady=2,
+            font=("TkDefaultFont", 8, "bold"),
+        )
+        self.edit_grip.pack(fill="x", pady=(0, 4))
+        self.edit_grip.bind("<ButtonPress-1>", self._start_edit_divider_drag)
+        self.edit_grip.bind("<B1-Motion>", self._drag_edit_divider)
+        self.edit_grip.bind("<ButtonRelease-1>", self._end_edit_divider_drag)
+        self.after_idle(self._set_initial_edit_split)
 
         colors_box = ttk.LabelFrame(
             colors_pane, text="Select & Group Detected Colors", padding=8
@@ -987,13 +1085,75 @@ class App(tk.Tk):
             self.update_deck_preview()
             self.save_settings()
 
+    def _set_initial_edit_split(self):
+        """Choose a balanced first split while preserving usable color space."""
+        if not hasattr(self, "edit_paned"):
+            return
+        try:
+            self.update_idletasks()
+            height = int(self.edit_paned.winfo_height())
+            if height <= 0:
+                return
+            split = int(height * 0.50)
+            split = max(85, min(split, height - 145))
+            self.edit_paned.sash_place(0, 0, split)
+        except Exception:
+            pass
+
+    def _start_edit_divider_drag(self, event):
+        self._edit_divider_dragging = True
+        return "break"
+
+    def _drag_edit_divider(self, event):
+        if not self._edit_divider_dragging or not hasattr(self, "edit_paned"):
+            return "break"
+        try:
+            local_y = int(event.y_root - self.edit_paned.winfo_rooty())
+            height = max(1, int(self.edit_paned.winfo_height()))
+            # Preserve a usable area for both panes.
+            local_y = max(75, min(local_y, height - 145))
+            self.edit_paned.sash_place(0, 0, local_y)
+        except Exception:
+            pass
+        return "break"
+
+    def _end_edit_divider_drag(self, event=None):
+        self._edit_divider_dragging = False
+        return "break"
+
+    def _schedule_preview_resize(self, event=None):
+        if self._preview_source_image is None:
+            return
+        if self._preview_resize_job is not None:
+            try:
+                self.after_cancel(self._preview_resize_job)
+            except Exception:
+                pass
+        self._preview_resize_job = self.after(35, self._render_preview_source)
+
+    def _render_preview_source(self):
+        self._preview_resize_job = None
+        if self._preview_source_image is None or not hasattr(self, "preview"):
+            return
+
+        try:
+            width = max(40, int(self.preview.winfo_width()) - 12)
+            height = max(40, int(self.preview.winfo_height()) - 12)
+            img = self._preview_source_image.copy()
+            img.thumbnail((width, height), Image.Resampling.LANCZOS)
+
+            self.preview_photo = ImageTk.PhotoImage(img)
+            self.original_preview_photo = self.preview_photo
+            self.preview.configure(image=self.preview_photo, text="")
+        except Exception:
+            pass
+
     def show_original_preview(self, path):
         try:
-            img = Image.open(path).convert("RGBA")
-            img.thumbnail((720, 450), Image.Resampling.LANCZOS)
-            self.original_preview_photo = ImageTk.PhotoImage(img)
-            self.preview.configure(image=self.original_preview_photo, text="")
+            self._preview_source_image = Image.open(path).convert("RGBA")
+            self._render_preview_source()
         except Exception as e:
+            self._preview_source_image = None
             self.preview.configure(text=str(e), image="")
 
     def make_checker(self, h, w):
@@ -1003,10 +1163,10 @@ class App(tk.Tk):
         return np.repeat(arr, 3, axis=2)
 
     def show_np_preview(self, arr):
-        img = Image.fromarray(arr.astype(np.uint8)).convert("RGBA")
-        img.thumbnail((720, 450), Image.Resampling.LANCZOS)
-        self.preview_photo = ImageTk.PhotoImage(img)
-        self.preview.configure(image=self.preview_photo, text="")
+        self._preview_source_image = Image.fromarray(
+            arr.astype(np.uint8)
+        ).convert("RGBA")
+        self._render_preview_source()
 
     def start_analyze(self):
         if not self.image_path.get():

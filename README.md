@@ -11,14 +11,8 @@ The application detects colors in a logo, lets you group them into printable col
 - Assign detected colors to print groups
 - `AUTO` mode for distributing anti-aliased or transitional pixels to neighboring print colors
 - `BG` mode for removing regions from the printable logo
-- Manual editor with:
-  - Brush
-  - Line
-  - Fill Area
-  - Eyedropper
-  - Undo
-  - Reset
-  - Zoom and pan
+- Manual editor with Brush, Line, Fill Area and Eyedropper
+- Undo, Reset, zoom and pan
 - Adjustable geometry quality and contour smoothing
 - STL geometry preview
 - Final target-surface preview
@@ -27,28 +21,43 @@ The application detects colors in a logo, lets you group them into printable col
 - Negative / clearance STL
 - Automatic project-specific output folder
 - English UI and output filenames
-- Small-display friendly Edit layout:
-  - Collapsible Quick Workflow
-  - Draggable divider between logo preview and color list
-  - Mouse-wheel scrolling in the detected-color list
+
+## Compact Display Features
+
+V7.6 improves the workflow on smaller screens:
+
+- **Collapsible Quick Workflow** in the Edit tab
+- A clearly visible **DRAG TO RESIZE PREVIEW / COLORS** grip
+- Draggable divider between the logo preview and detected-color list
+- The logo preview automatically scales with the available pane size
+- The complete logo remains visible instead of being cropped
+- The entire left settings column is vertically scrollable
+- Mouse-wheel scrolling works on the left settings column
+- Mouse-wheel scrolling also works in the detected-color list
+
+### Default Settings Sections
+
+Open by default:
+
+- File & Export
+- Logo & Analysis
+- Color Analysis
+
+Collapsed by default:
+
+- Profile
+- Target Surface & Fit
+- Geometry Quality
 
 ## Typical Workflow
 
 1. Load your logo and click **(Start) Analyze Colors**.
-2. Click **Show** next to a detected color, then assign it to a print group using the color buttons.
-3. Use **AUTO** for transition or anti-aliasing shades that should be distributed between neighboring print colors.
-4. Open the **Manual** tab and click **Calculate** to resolve AUTO pixels.
-5. Make any pixel-level corrections if needed, then click **Calculate** again.
+2. Click **Show** next to a detected color, then assign it to a print group.
+3. Use **AUTO** for transition or anti-aliasing shades.
+4. Open **Manual** and click **Calculate** to resolve AUTO pixels.
+5. Make pixel-level corrections if required and click **Calculate** again.
 6. Review the result in **STL Preview**.
 7. Click **(Finish) Generate STLs**.
-
-## Small Display Tips
-
-The **Quick Workflow** section in the Edit tab can be collapsed to free vertical space.
-
-The divider between **Preview & Highlight** and **Select & Group Detected Colors** can be dragged up or down. This lets you reduce the logo preview and give more room to the detected-color list.
-
-When the mouse pointer is over the detected-color list, the **mouse wheel** scrolls the list. The scrollbar remains available as well.
 
 ## Output Files
 
@@ -67,15 +76,7 @@ Monopoly_complete_cutout.stl
 Monopoly_negative_clearance_0_00mm.stl
 ```
 
-The tool attempts to generate watertight/manifold geometry. If a remaining topology issue is detected, the STL is still exported and the application warns you that your slicer's repair function may be required.
-
 ## Run from Source
-
-### Requirements
-
-- Windows 10 or Windows 11
-- Python 3
-- Packages listed in `requirements.txt`
 
 Install dependencies:
 
@@ -83,13 +84,13 @@ Install dependencies:
 python -m pip install -r requirements.txt
 ```
 
-Start the application:
+Start:
 
 ```bash
 python logo_inlay_app.py
 ```
 
-Or use:
+or use:
 
 ```text
 start_app.bat
@@ -103,22 +104,11 @@ Run:
 build_exe.bat
 ```
 
-The script installs the required packages and uses PyInstaller to create a standalone Windows executable.
-
-The resulting EXE is placed in:
+The standalone executable is created in:
 
 ```text
 dist/
 ```
-
-The compiled EXE can be copied to another Windows PC without requiring a separate Python installation.
-
-## Notes
-
-- The tool is designed primarily for flat logo inlays and multi-color 3D printing.
-- Raster logos with clearly separated color regions usually produce the best results.
-- Small details, compression artifacts, and anti-aliasing may require manual cleanup.
-- Minor STL topology warnings can usually be repaired by the slicer.
 
 ## Development
 
