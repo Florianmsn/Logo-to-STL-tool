@@ -20,7 +20,7 @@ except ImportError:
     from logo_inlay_core import closest_color_name as guess_color_name
 
 
-APP_TITLE = "Logo Inlay Tool 7.4"
+APP_TITLE = "Logo Inlay Tool 7.5"
 MANUAL_AUTO_LABEL = -2147483000
 APP_DIR = Path.home() / ".logo_inlay_tool"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -321,7 +321,7 @@ class App(tk.Tk):
         super().__init__()
         self.title(APP_TITLE)
         self.geometry("1380x860")
-        self.minsize(1120, 720)
+        self.minsize(1000, 600)
 
         APP_DIR.mkdir(exist_ok=True)
         self.profiles = self.load_profiles()
@@ -668,13 +668,15 @@ class App(tk.Tk):
         self.notebook.add(self.tab_deck, text="Final Preview")
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
 
-        workflow_box = ttk.LabelFrame(self.tab_edit, text="Quick Workflow", padding=8)
-        workflow_box.pack(fill="x", pady=(0, 6))
+        # Quick Workflow can be collapsed to free vertical space on smaller displays.
+        self.workflow_section = CollapsibleFrame(
+            self.tab_edit, "Quick Workflow", expanded=True
+        )
+        self.workflow_section.pack(fill="x", pady=(0, 6))
+        workflow_box = self.workflow_section.body
 
         workflow_steps = [
-            (
-                "1. Start — Load your logo, then click (Start) Analyze Colors."
-            ),
+            "1. Start — Load your logo, then click (Start) Analyze Colors.",
             (
                 "2. Group colors — Click Show next to a detected color, then assign it to a print "
                 "group using the color buttons below. If a detected shade should be shared between "
@@ -704,20 +706,33 @@ class App(tk.Tk):
             self.workflow_labels.append(lbl)
 
         def resize_workflow(event):
-            # Keep the complete workflow visible at any supported window width.
-            width = max(260, int(event.width) - 24)
+            width = max(240, int(event.width) - 24)
             for label in self.workflow_labels:
                 label.configure(wraplength=width)
 
         workflow_box.bind("<Configure>", resize_workflow)
 
-        preview_box = ttk.LabelFrame(self.tab_edit, text="Preview & Highlight", padding=8)
+        # Movable vertical splitter: drag the divider to give more space either
+        # to the logo preview or to the detected-color list.
+        self.edit_paned = ttk.Panedwindow(self.tab_edit, orient="vertical")
+        self.edit_paned.pack(fill="both", expand=True)
+
+        preview_pane = ttk.Frame(self.edit_paned)
+        colors_pane = ttk.Frame(self.edit_paned)
+        self.edit_paned.add(preview_pane, weight=3)
+        self.edit_paned.add(colors_pane, weight=2)
+
+        preview_box = ttk.LabelFrame(
+            preview_pane, text="Preview & Highlight", padding=8
+        )
         preview_box.pack(fill="both", expand=True)
         self.preview = ttk.Label(preview_box, relief="groove", anchor="center")
         self.preview.pack(fill="both", expand=True)
 
-        colors_box = ttk.LabelFrame(self.tab_edit, text="Select & Group Detected Colors", padding=8)
-        colors_box.pack(fill="x", pady=(8, 0))
+        colors_box = ttk.LabelFrame(
+            colors_pane, text="Select & Group Detected Colors", padding=8
+        )
+        colors_box.pack(fill="both", expand=True)
 
         header = ttk.Frame(colors_box)
         header.pack(fill="x", pady=(0, 5))
@@ -752,19 +767,51 @@ class App(tk.Tk):
             self.quick_frame, text="BG", width=4,
             command=lambda: self.assign_selected_to_named_group("zu Hintergrund")
         ).grid(row=0, column=9, padx=2)
-        ToolTip(self.quick_frame.winfo_children()[-2], "AUTO: assign transition pixels locally to the most plausible neighboring print color when Calculate is pressed.")
-        ToolTip(self.quick_frame.winfo_children()[-1], "BG: remove this region from the logo and treat it as background / target-surface color.")
+        ToolTip(
+            self.quick_frame.winfo_children()[-2],
+            "AUTO: assign transition pixels locally to the most plausible neighboring print color when Calculate is pressed."
+        )
+        ToolTip(
+            self.quick_frame.winfo_children()[-1],
+            "BG: remove this region from the logo and treat it as background / target-surface color."
+        )
 
         color_wrap = ttk.Frame(colors_box)
-        color_wrap.pack(fill="x")
-        self.colors_canvas = tk.Canvas(color_wrap, height=205, highlightthickness=0)
-        self.colors_scroll = ttk.Scrollbar(color_wrap, orient="vertical", command=self.colors_canvas.yview)
+        color_wrap.pack(fill="both", expand=True)
+
+        # The color list now expands with the pane instead of using a fixed height.
+        self.colors_canvas = tk.Canvas(
+            color_wrap, highlightthickness=0, height=120
+        )
+        self.colors_scroll = ttk.Scrollbar(
+            color_wrap, orient="vertical", command=self.colors_canvas.yview
+        )
         self.colors_inner = ttk.Frame(self.colors_canvas)
-        self.colors_inner.bind("<Configure>", lambda e: self.colors_canvas.configure(scrollregion=self.colors_canvas.bbox("all")))
-        self.colors_canvas.create_window((0, 0), window=self.colors_inner, anchor="nw")
+        self.colors_inner.bind(
+            "<Configure>",
+            lambda e: self.colors_canvas.configure(
+                scrollregion=self.colors_canvas.bbox("all")
+            )
+        )
+        self.colors_window = self.colors_canvas.create_window(
+            (0, 0), window=self.colors_inner, anchor="nw"
+        )
         self.colors_canvas.configure(yscrollcommand=self.colors_scroll.set)
-        self.colors_canvas.pack(side="left", fill="x", expand=True)
+        self.colors_canvas.pack(side="left", fill="both", expand=True)
         self.colors_scroll.pack(side="right", fill="y")
+
+        # Keep the inner frame as wide as the visible canvas.
+        self.colors_canvas.bind(
+            "<Configure>",
+            lambda e: self.colors_canvas.itemconfigure(
+                self.colors_window, width=e.width
+            )
+        )
+
+        # Mouse wheel scrolling works whenever the pointer is over the color list
+        # or one of its child widgets. The normal scrollbar still works as before.
+        self._bind_color_mousewheel(self.colors_canvas)
+        self._bind_color_mousewheel(self.colors_inner)
 
         # Manual editor
         toolbar = ttk.LabelFrame(self.tab_manual, text="Manual Corrections", padding=8)
@@ -1002,6 +1049,34 @@ class App(tk.Tk):
             return fallback_rgb
         return [160, 160, 160]
 
+    def _on_colors_mousewheel(self, event):
+        if not hasattr(self, "colors_canvas"):
+            return "break"
+
+        # Windows/macOS use event.delta; X11 commonly uses Button-4/Button-5.
+        if getattr(event, "num", None) == 4:
+            steps = -1
+        elif getattr(event, "num", None) == 5:
+            steps = 1
+        else:
+            delta = getattr(event, "delta", 0)
+            if delta == 0:
+                return "break"
+            # Windows normally reports multiples of 120.
+            steps = -int(delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+
+        self.colors_canvas.yview_scroll(steps, "units")
+        return "break"
+
+    def _bind_color_mousewheel(self, widget):
+        """Bind wheel scrolling to a widget without taking over the whole app."""
+        try:
+            widget.bind("<MouseWheel>", self._on_colors_mousewheel, add="+")
+            widget.bind("<Button-4>", self._on_colors_mousewheel, add="+")
+            widget.bind("<Button-5>", self._on_colors_mousewheel, add="+")
+        except Exception:
+            pass
+
     def render_colors(self):
         for child in self.colors_inner.winfo_children():
             child.destroy()
@@ -1050,6 +1125,10 @@ class App(tk.Tk):
 
             enabled.trace_add("write", changed)
             group.trace_add("write", changed)
+
+            self._bind_color_mousewheel(row)
+            for child in row.winfo_children():
+                self._bind_color_mousewheel(child)
 
             self.color_rows.append({
                 "cluster": cluster_id,

@@ -6,28 +6,31 @@ The application detects colors in a logo, lets you group them into printable col
 
 ## Features
 
-* Load PNG, JPG, JPEG, WEBP, and BMP logos
-* Automatic color detection and grouping
-* Assign detected colors to print groups
-* `AUTO` mode for distributing anti-aliased or transitional pixels to neighboring print colors
-* `BG` mode for removing regions from the printable logo
-* Manual editor with:
-
-  * Brush
-  * Line
-  * Fill Area
-  * Eyedropper
-  * Undo
-  * Reset
-  * Zoom and pan
-* Adjustable geometry quality and contour smoothing
-* Final STL geometry preview
-* Target surface preview
-* Separate STL export for every print color
-* Complete cutout STL
-* Negative / clearance STL
-* Automatic project-specific output folder
-* English UI and output filenames
+- Load PNG, JPG, JPEG, WEBP, and BMP logos
+- Automatic color detection and grouping
+- Assign detected colors to print groups
+- `AUTO` mode for distributing anti-aliased or transitional pixels to neighboring print colors
+- `BG` mode for removing regions from the printable logo
+- Manual editor with:
+  - Brush
+  - Line
+  - Fill Area
+  - Eyedropper
+  - Undo
+  - Reset
+  - Zoom and pan
+- Adjustable geometry quality and contour smoothing
+- STL geometry preview
+- Final target-surface preview
+- Separate STL export for every print color
+- Complete cutout STL
+- Negative / clearance STL
+- Automatic project-specific output folder
+- English UI and output filenames
+- Small-display friendly Edit layout:
+  - Collapsible Quick Workflow
+  - Draggable divider between logo preview and color list
+  - Mouse-wheel scrolling in the detected-color list
 
 ## Typical Workflow
 
@@ -39,21 +42,29 @@ The application detects colors in a logo, lets you group them into printable col
 6. Review the result in **STL Preview**.
 7. Click **(Finish) Generate STLs**.
 
+## Small Display Tips
+
+The **Quick Workflow** section in the Edit tab can be collapsed to free vertical space.
+
+The divider between **Preview & Highlight** and **Select & Group Detected Colors** can be dragged up or down. This lets you reduce the logo preview and give more room to the detected-color list.
+
+When the mouse pointer is over the detected-color list, the **mouse wheel** scrolls the list. The scrollbar remains available as well.
+
 ## Output Files
 
 For a project named `Monopoly`, the output folder is automatically created as:
 
 ```text
-Monopoly\_STL/
+Monopoly_STL/
 ```
 
 Example files:
 
 ```text
-Monopoly\_color\_01\_black.stl
-Monopoly\_color\_02\_white.stl
-Monopoly\_complete\_cutout.stl
-Monopoly\_negative\_clearance\_0\_00mm.stl
+Monopoly_color_01_black.stl
+Monopoly_color_02_white.stl
+Monopoly_complete_cutout.stl
+Monopoly_negative_clearance_0_00mm.stl
 ```
 
 The tool attempts to generate watertight/manifold geometry. If a remaining topology issue is detected, the STL is still exported and the application warns you that your slicer's repair function may be required.
@@ -62,26 +73,26 @@ The tool attempts to generate watertight/manifold geometry. If a remaining topol
 
 ### Requirements
 
-* Windows 10 or Windows 11
-* Python 3
-* Packages listed in `requirements.txt`
+- Windows 10 or Windows 11
+- Python 3
+- Packages listed in `requirements.txt`
 
-Install the dependencies:
+Install dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-Then start the application:
+Start the application:
 
 ```bash
-python logo\_inlay\_app.py
+python logo_inlay_app.py
 ```
 
-You can also use:
+Or use:
 
 ```text
-start\_app.bat
+start_app.bat
 ```
 
 ## Build a Standalone Windows EXE
@@ -89,35 +100,34 @@ start\_app.bat
 Run:
 
 ```text
-build\_exe.bat
+build_exe.bat
 ```
 
-The script installs the required Python packages and uses PyInstaller to create a standalone Windows executable.
+The script installs the required packages and uses PyInstaller to create a standalone Windows executable.
 
-The resulting file will be placed in:
+The resulting EXE is placed in:
 
 ```text
 dist/
 ```
 
-The compiled EXE can then be copied to another Windows PC without requiring a separate Python installation.
+The compiled EXE can be copied to another Windows PC without requiring a separate Python installation.
 
 ## Notes
 
-* The tool is designed primarily for flat logo inlays and multi-color 3D printing.
-* Raster logos with clear color regions usually produce the best results.
-* Very small details, compression artifacts, and anti-aliasing may require manual cleanup.
-* STL repair warnings do not necessarily mean the model is unusable. Many slicers can automatically repair minor mesh issues.
+- The tool is designed primarily for flat logo inlays and multi-color 3D printing.
+- Raster logos with clearly separated color regions usually produce the best results.
+- Small details, compression artifacts, and anti-aliasing may require manual cleanup.
+- Minor STL topology warnings can usually be repaired by the slicer.
 
 ## Development
 
-This project was created by **Florian Hofmann Hesse** with development assistance from **ChatGPT by OpenAI**.
+This project was created by **Florian Hesse** with development assistance from **ChatGPT by OpenAI**.
 
 ChatGPT was used throughout the project for code generation, debugging, UI refinement, testing ideas, and workflow development.
 
 ## License
 
-This project is licensed under the **License**.
+This project is licensed under the **MIT License**.
 
 See [LICENSE](LICENSE) for details.
-
