@@ -1,4 +1,4 @@
 @echo off
-title Logo Inlay Tool 7.6
+title Logo to STL Tool 7.7
 python logo_inlay_app.py
 pause

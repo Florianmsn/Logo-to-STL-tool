@@ -437,6 +437,160 @@ def smooth_group_partition(label_img: np.ndarray, groups: dict,
     return names, out, smoothed_active
 
 
+def _gap_pixel_vote(gap: Polygon, group_map: np.ndarray, mm_per_px: float):
+    """Return the raster group id that locally owns most of a vectorization gap.
+
+    The smoothed raster partition is the last unambiguous color assignment
+    before contour simplification. Mapping tiny leftover polygons back onto it
+    gives us a local owner instead of assigning every gap to the globally
+    largest color.
+    """
+    if gap.is_empty or gap.area <= 0 or mm_per_px <= 0:
+        return None
+
+    h, w = group_map.shape
+    minx, miny, maxx, maxy = gap.bounds
+
+    x0 = max(0, int(np.floor(minx / mm_per_px)) - 1)
+    x1 = min(w - 1, int(np.ceil(maxx / mm_per_px)) + 1)
+    y0 = max(0, int(np.floor(h - (maxy / mm_per_px))) - 1)
+    y1 = min(h - 1, int(np.ceil(h - (miny / mm_per_px))) + 1)
+
+    if x1 < x0 or y1 < y0:
+        return None
+
+    local = np.zeros((y1 - y0 + 1, x1 - x0 + 1), dtype=np.uint8)
+
+    def ring_to_pixels(ring):
+        pts = []
+        for x, y in ring.coords:
+            px = int(round(x / mm_per_px)) - x0
+            py = int(round(h - (y / mm_per_px))) - y0
+            pts.append([px, py])
+        return np.asarray(pts, dtype=np.int32)
+
+    try:
+        outer = ring_to_pixels(gap.exterior)
+        if len(outer) >= 3:
+            cv2.fillPoly(local, [outer], 1)
+        for hole in gap.interiors:
+            pts = ring_to_pixels(hole)
+            if len(pts) >= 3:
+                cv2.fillPoly(local, [pts], 0)
+    except Exception:
+        return None
+
+    labels = group_map[y0:y1 + 1, x0:x1 + 1][local.astype(bool)]
+    labels = labels[labels >= 0]
+    if labels.size == 0:
+        return None
+
+    ids, counts = np.unique(labels.astype(np.int32), return_counts=True)
+    if ids.size == 0:
+        return None
+
+    return int(ids[int(np.argmax(counts))])
+
+
+def _choose_local_gap_owner(
+    gap: Polygon,
+    names: list[str],
+    group_map: np.ndarray,
+    mm_per_px: float,
+    partition: dict,
+    raw: dict,
+    simplify_mm: float,
+):
+    """Choose the most plausible local color owner for one leftover polygon.
+
+    The most important rule is continuity: whenever possible, a gap is assigned
+    to a color it actually touches so it merges into that existing part instead
+    of becoming a new floating island. The raster vote then resolves which of
+    the touching colors is locally correct.
+    """
+    gid = _gap_pixel_vote(gap, group_map, mm_per_px)
+    voted = names[gid] if gid is not None and 0 <= gid < len(names) else None
+
+    # First identify colors that genuinely share boundary/contact with this gap.
+    # Because the gap was produced by subtracting the vector pieces from total,
+    # exact boundary contact is normally available.
+    exact_contacts = []
+    for name in names:
+        geom = partition.get(name)
+        if geom is None or geom.is_empty:
+            continue
+        try:
+            shared = float(gap.boundary.intersection(geom.boundary).length)
+        except Exception:
+            shared = 0.0
+        if shared > 1e-10:
+            exact_contacts.append((shared, name))
+
+    if exact_contacts:
+        touching_names = {name for _, name in exact_contacts}
+        if voted in touching_names:
+            return voted
+        exact_contacts.sort(reverse=True)
+        return exact_contacts[0][1]
+
+    # Numerical contour simplification can leave a microscopic separation.
+    # Use a very narrow local band as a second continuity test.
+    tol = max(float(mm_per_px) * 0.55, float(simplify_mm) * 0.12, 1e-6)
+    band = gap.buffer(tol)
+    near_contacts = []
+    for name in names:
+        geom = partition.get(name)
+        if geom is None or geom.is_empty:
+            continue
+        try:
+            score = float(band.intersection(geom).area)
+        except Exception:
+            score = 0.0
+        if score > 0:
+            near_contacts.append((score, name))
+
+    if near_contacts:
+        touching_names = {name for _, name in near_contacts}
+        if voted in touching_names:
+            return voted
+        near_contacts.sort(reverse=True)
+        return near_contacts[0][1]
+
+    # If there is no geometric contact at all, fall back to the smoothed raster
+    # ownership map, which is still local and far better than a global largest
+    # color fallback.
+    if voted is not None:
+        geom = raw.get(voted)
+        if geom is not None and not geom.is_empty:
+            return voted
+
+    distances = []
+    probe = gap.representative_point()
+    for name in names:
+        geom = partition.get(name)
+        if geom is None or geom.is_empty:
+            geom = raw.get(name)
+        if geom is None or geom.is_empty:
+            continue
+        try:
+            distances.append((float(probe.distance(geom)), name))
+        except Exception:
+            pass
+
+    if distances:
+        distances.sort(key=lambda item: item[0])
+        return distances[0][1]
+
+    candidates = [
+        (float(raw[name].area), name)
+        for name in names
+        if name in raw and raw[name] is not None and not raw[name].is_empty
+    ]
+    if candidates:
+        return max(candidates)[1]
+    return None
+
+
 def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
                          min_area_px: int, min_area_mm2: float,
                          simplify_mm: float, close_strength: int,
@@ -449,8 +603,13 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
       * group geometries do not overlap
       * union(group geometries) == total, apart from floating point noise
 
-    Small/vectorization gaps are absorbed into the largest color group instead
-    of becoming holes between STL parts.
+    V7.7 change:
+      Contour simplification can leave microscopic polygons between neighboring
+      vector colors. Earlier versions assigned every such remainder to the
+      globally largest color, which could create thin wrong-color lines and many
+      tiny islands around lettering. We now vectorize ALL groups first, then
+      assign only the true leftover polygons to their locally most plausible
+      color using the smoothed raster ownership map and geometric adjacency.
     """
     names, group_map, active_mask = smooth_group_partition(
         label_img, groups, mm_per_px, edge_smoothing_mm
@@ -461,10 +620,11 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
     # Clean only the global active mask. This avoids deleting individual color
     # fragments in a way that would create gaps between neighboring colors.
     master_mask = clean_mask(active_mask, min_area_px, close_strength)
-    total = external_silhouette_to_polygons(master_mask, mm_per_px, simplify_mm, contour_mode)
+    total = external_silhouette_to_polygons(
+        master_mask, mm_per_px, simplify_mm, contour_mode
+    )
 
-    # Explicit "zu Hintergrund" is different from an accidental vectorization gap:
-    # it must remain background, including enclosed areas inside the logo.
+    # Explicit background remains a real hole/background region.
     if explicit_background_mask is not None and np.any(explicit_background_mask):
         smooth_bg_mask = _smooth_binary_mask(
             explicit_background_mask, edge_smoothing_mm, mm_per_px
@@ -484,31 +644,82 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
     raw = {}
     for gid, name in enumerate(names):
         mask = (group_map == gid) & master_mask
-        # Do NOT remove components independently here; the common total decides
-        # what survives. Independent cleanup is exactly what used to make gaps.
         geom = contour_to_polygons(mask, mm_per_px, simplify_mm, contour_mode)
         if not geom.is_empty:
             geom = geom.intersection(total).buffer(0)
         raw[name] = geom
 
-    # Process smaller/detail groups first and reserve the largest group as the
-    # final remainder. Thus any microscopic approximation gap becomes part of
-    # the dominant color instead of remaining empty.
     nonempty = [n for n in names if n in raw and not raw[n].is_empty]
     if not nonempty:
         return {}, total
 
+    # Keep the previous detail-preserving overlap rule: smaller groups win when
+    # simplified contours overlap. Crucially, unlike <=7.6, the largest group is
+    # also vectorized here instead of becoming the entire global remainder.
     ordered = sorted(nonempty, key=lambda n: raw[n].area)
     remaining = total
     partition = {}
-    for name in ordered[:-1]:
+
+    for name in ordered:
         piece = raw[name].intersection(remaining).buffer(0)
         if not piece.is_empty:
             partition[name] = piece
             remaining = remaining.difference(piece).buffer(0)
 
-    last = ordered[-1]
-    partition[last] = remaining.buffer(0)
+    # What is left now is ONLY approximation/vectorization gap geometry.
+    # Allocate each connected gap locally instead of gifting all of it to the
+    # dominant color.
+    if not remaining.is_empty and remaining.area > 0:
+        gaps_by_owner = {}
+        for gap in iter_polygons(remaining):
+            if gap.is_empty or gap.area <= 0:
+                continue
+
+            owner = _choose_local_gap_owner(
+                gap=gap,
+                names=names,
+                group_map=group_map,
+                mm_per_px=mm_per_px,
+                partition=partition,
+                raw=raw,
+                simplify_mm=simplify_mm,
+            )
+            if owner is None:
+                continue
+            gaps_by_owner.setdefault(owner, []).append(gap)
+
+        for owner, gaps in gaps_by_owner.items():
+            existing = partition.get(owner)
+            pieces = ([existing] if existing is not None and not existing.is_empty else [])
+            pieces.extend(gaps)
+            merged = unary_union(pieces).buffer(0)
+            if not merged.is_empty:
+                partition[owner] = merged
+
+    # Numerical safety net. This should normally be effectively zero area.
+    union_partition = unary_union(
+        [g for g in partition.values() if g is not None and not g.is_empty]
+    ).buffer(0)
+    final_missing = total.difference(union_partition).buffer(0)
+
+    if not final_missing.is_empty and final_missing.area > 1e-10:
+        # Even this last-resort path is local per connected component.
+        for gap in list(iter_polygons(final_missing)):
+            owner = _choose_local_gap_owner(
+                gap=gap,
+                names=names,
+                group_map=group_map,
+                mm_per_px=mm_per_px,
+                partition=partition,
+                raw=raw,
+                simplify_mm=simplify_mm,
+            )
+            if owner is None:
+                continue
+            existing = partition.get(owner)
+            partition[owner] = unary_union(
+                [g for g in (existing, gap) if g is not None and not g.is_empty]
+            ).buffer(0)
 
     # Preserve original UI/group order.
     result = {}
