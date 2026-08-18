@@ -135,7 +135,7 @@ def quantize(rgba: np.ndarray, visible: np.ndarray, k: int):
     rgb = rgba[:, :, :3]
     pixels = rgb[visible].reshape((-1, 3)).astype(np.float32)
     if len(pixels) == 0:
-        raise ValueError("Keine sichtbaren Pixel gefunden.")
+        raise ValueError("No visible pixels were found in the selected image.")
     k = max(1, min(k, len(np.unique(pixels.astype(np.uint8), axis=0))))
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.12)
     _, labels, centers = cv2.kmeans(pixels, k, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
@@ -603,7 +603,7 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
       * group geometries do not overlap
       * union(group geometries) == total, apart from floating point noise
 
-    V7.7 change:
+    Local-gap partitioning:
       Contour simplification can leave microscopic polygons between neighboring
       vector colors. Earlier versions assigned every such remainder to the
       globally largest color, which could create thin wrong-color lines and many
@@ -869,7 +869,7 @@ def _extrude_polygon_manifold(poly: Polygon, height_mm: float) -> trimesh.Trimes
     if not poly.is_valid:
         poly = poly.buffer(0)
         if not isinstance(poly, Polygon):
-            raise ValueError("Polygon konnte für manifold STL nicht eindeutig repariert werden.")
+            raise ValueError("A polygon could not be repaired unambiguously for manifold STL export.")
 
     vertices = []
     faces = []
@@ -914,8 +914,8 @@ def _extrude_polygon_manifold(poly: Polygon, height_mm: float) -> trimesh.Trimes
 
     if not triangles:
         raise RuntimeError(
-            "Keine sichere Polygon-Triangulation verfügbar. "
-            "Bitte Shapely >= 2.1 installieren."
+            "No safe polygon triangulation is available. "
+            "Please install Shapely >= 2.1."
         )
 
     for coords in triangles:
@@ -1339,6 +1339,238 @@ def upscale_geometry_grid(label_img, explicit_background_mask=None, target_pixel
     return resized, bg
 
 
+
+def _build_print_groups(color_plan: list[dict]) -> dict:
+    """Return enabled printable groups as {safe_group_name: [cluster_ids]}."""
+    groups = {}
+    for item in color_plan:
+        if not item.get("enabled", True):
+            continue
+        group_key = str(item.get("group") or item.get("name") or "").strip()
+        if group_key.lower() in ("zu hintergrund", "auto verteilen"):
+            continue
+        cluster = int(item["cluster"])
+        group = safe_filename_part(group_key or f"group_{cluster}")
+        groups.setdefault(group, []).append(cluster)
+    return groups
+
+
+def _active_content_bbox_px(label_img: np.ndarray, groups: dict):
+    """Return (x0, y0, x1, y1, width_px, height_px) for printable pixels."""
+    if not groups:
+        return None
+
+    cluster_ids = []
+    for ids in groups.values():
+        cluster_ids.extend(int(v) for v in ids)
+    if not cluster_ids:
+        return None
+
+    mask = np.isin(label_img, cluster_ids)
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    return x0, y0, x1, y1, (x1 - x0 + 1), (y1 - y0 + 1)
+
+
+def _fit_partition_to_requested_size(
+    geoms: dict,
+    total,
+    target_width_mm: float,
+    target_height_mm: float | None = None,
+    keep_aspect: bool = True,
+):
+    """Scale a finished partition so requested dimensions describe the STL itself.
+
+    Width always means the final vector geometry width, not the source-image
+    canvas width. With aspect lock enabled the scale is uniform. With the lock
+    disabled, width and height are applied independently.
+    """
+    if total is None or total.is_empty:
+        return geoms, total
+
+    target_width_mm = float(target_width_mm)
+    if not np.isfinite(target_width_mm) or target_width_mm <= 0:
+        raise ValueError("Logo Width must be greater than 0 mm.")
+
+    minx, miny, maxx, maxy = total.bounds
+    current_w = float(maxx - minx)
+    current_h = float(maxy - miny)
+    if current_w <= 1e-12 or current_h <= 1e-12:
+        raise ValueError("The final logo geometry has no measurable width or height.")
+
+    sx = target_width_mm / current_w
+
+    if keep_aspect:
+        sy = sx
+    else:
+        if target_height_mm is None:
+            raise ValueError("Logo Height is required when Lock aspect ratio is disabled.")
+        target_height_mm = float(target_height_mm)
+        if not np.isfinite(target_height_mm) or target_height_mm <= 0:
+            raise ValueError("Logo Height must be greater than 0 mm.")
+        sy = target_height_mm / current_h
+
+    origin = (minx, miny)
+    fitted_geoms = {
+        name: scale_geom(g, xfact=sx, yfact=sy, origin=origin)
+        for name, g in geoms.items()
+    }
+    fitted_total = scale_geom(total, xfact=sx, yfact=sy, origin=origin)
+
+    # Normalize tiny floating-point drift so the bounds start at the same origin.
+    return fitted_geoms, fitted_total
+
+
+def _prepare_partition_geometry(
+    image_path: Path,
+    color_plan: list[dict],
+    target_mode: str = "manual",
+    manual_width_mm: float = 70,
+    manual_height_mm: float | None = None,
+    keep_aspect: bool = True,
+    deck_width_mm: float = 100,
+    deck_height_mm: float = 70,
+    margin_mm: float = 5,
+    fit_percent: float = 90,
+    detect_colors: int = 8,
+    background_mode: str = "transparent",
+    white_threshold: int = 245,
+    working_pixels: int = 1400,
+    geometry_pixels: int = 1600,
+    min_area_mm2: float = 0.12,
+    simplify_mm: float = 0.12,
+    close_strength: int = 0,
+    auto_merge: bool = True,
+    merge_distance: float = 18,
+    contour_mode: str = "straight",
+    edge_smoothing_mm: float = 0.18,
+    label_override=None,
+    manual_background_mask=None,
+):
+    """Shared geometry path used by STL Preview and STL export.
+
+    Keeping preview and export on one preparation path prevents them from
+    silently disagreeing about target size, background or color partitioning.
+    """
+    image_path = Path(image_path)
+    analysis = analyze_colors(
+        image_path,
+        working_pixels,
+        detect_colors,
+        background_mode,
+        white_threshold,
+        auto_merge,
+        merge_distance,
+    )
+
+    if label_override is not None:
+        label_img = np.asarray(
+            label_override, dtype=analysis["label_img"].dtype
+        ).copy()
+        if label_img.shape != analysis["label_img"].shape:
+            raise ValueError(
+                "Manual editing data has a different size than the current analysis."
+            )
+    else:
+        label_img = analysis["label_img"].copy()
+
+    label_img, plan, explicit_background_mask = extract_background_groups(
+        label_img, color_plan
+    )
+
+    if manual_background_mask is not None:
+        manual_bg = np.asarray(manual_background_mask, dtype=bool)
+        if manual_bg.shape != label_img.shape:
+            raise ValueError(
+                "The manual background mask has a different size than the current analysis."
+            )
+        explicit_background_mask = explicit_background_mask | manual_bg
+        label_img[manual_bg] = -1
+
+    label_img, plan = redistribute_auto_groups(label_img, plan)
+    label_img, explicit_background_mask = upscale_geometry_grid(
+        label_img, explicit_background_mask, geometry_pixels
+    )
+
+    groups = _build_print_groups(plan)
+    bbox = _active_content_bbox_px(label_img, groups)
+    if bbox is None:
+        raise ValueError(
+            "No active printable color area remains. Check color assignments and background settings."
+        )
+
+    _, _, _, _, content_w_px, content_h_px = bbox
+    content_aspect = content_w_px / max(1, content_h_px)
+
+    if target_mode == "manual":
+        width_mm = float(manual_width_mm)
+    else:
+        width_mm = compute_logo_width(
+            content_aspect,
+            target_mode,
+            manual_width_mm,
+            deck_width_mm,
+            deck_height_mm,
+            margin_mm,
+            fit_percent,
+        )
+
+    if not np.isfinite(width_mm) or width_mm <= 0:
+        raise ValueError("Logo Width must be greater than 0 mm.")
+
+    # Use the printable content width rather than the complete source-image
+    # canvas. Transparent/removed margins therefore no longer shrink the STL.
+    mm_per_px = width_mm / max(1, content_w_px)
+    min_area_px = max(
+        1,
+        int(float(min_area_mm2) / max(1e-12, mm_per_px ** 2)),
+    )
+
+    geoms, total = make_exact_partition(
+        label_img=label_img,
+        groups=groups,
+        mm_per_px=mm_per_px,
+        min_area_px=min_area_px,
+        min_area_mm2=min_area_mm2,
+        simplify_mm=simplify_mm,
+        close_strength=close_strength,
+        contour_mode=contour_mode,
+        explicit_background_mask=explicit_background_mask,
+        edge_smoothing_mm=edge_smoothing_mm,
+    )
+
+    if not geoms or total is None or total.is_empty:
+        raise ValueError(
+            "No printable geometry was generated. Check the active color groups."
+        )
+
+    # The UI always uses manual mode. For compatibility, area mode also gets
+    # its computed width applied exactly to the final vector bounds.
+    geoms, total = _fit_partition_to_requested_size(
+        geoms,
+        total,
+        target_width_mm=width_mm,
+        target_height_mm=manual_height_mm,
+        keep_aspect=(True if target_mode != "manual" else bool(keep_aspect)),
+    )
+
+    return {
+        "analysis": analysis,
+        "label_img": label_img,
+        "plan": plan,
+        "groups": groups,
+        "geoms": geoms,
+        "total": total,
+        "vectorization_mm_per_px": mm_per_px,
+        "content_bbox_px": bbox,
+        "content_aspect": content_aspect,
+    }
+
+
 def build_partition_preview(
     image_path: Path,
     color_plan: list[dict],
@@ -1361,89 +1593,67 @@ def build_partition_preview(
     manual_background_mask=None,
     group_colors=None,
 ):
-    """Build a raster preview from the exact same vector partition used by STL export."""
-    image_path = Path(image_path)
-    analysis = analyze_colors(
-        image_path, working_pixels, detect_colors, background_mode,
-        white_threshold, auto_merge, merge_distance
-    )
-
-    if label_override is not None:
-        label_img = np.asarray(label_override, dtype=analysis["label_img"].dtype).copy()
-        if label_img.shape != analysis["label_img"].shape:
-            raise ValueError("Vorschau: manuelle Bearbeitung hat falsche Bildgröße.")
-    else:
-        label_img = analysis["label_img"].copy()
-
-    label_img, plan, explicit_background_mask = extract_background_groups(label_img, color_plan)
-
-    if manual_background_mask is not None:
-        manual_bg = np.asarray(manual_background_mask, dtype=bool)
-        if manual_bg.shape != label_img.shape:
-            raise ValueError("Vorschau: manuelle Hintergrundmaske hat falsche Bildgröße.")
-        explicit_background_mask = explicit_background_mask | manual_bg
-        label_img[manual_bg] = -1
-
-    label_img, plan = redistribute_auto_groups(label_img, plan)
-    label_img, explicit_background_mask = upscale_geometry_grid(
-        label_img, explicit_background_mask, geometry_pixels
-    )
-
-    ih, iw = label_img.shape
-    width_mm = float(manual_width_mm)
-    mm_per_px = width_mm / max(1, iw)
-    min_area_px = max(1, int(min_area_mm2 / max(1e-12, mm_per_px ** 2)))
-
-    groups = {}
-    for item in plan:
-        if not item.get("enabled", True):
-            continue
-        group_key = str(item.get("group") or item.get("name") or "").strip()
-        if group_key.lower() in ("zu hintergrund", "auto verteilen"):
-            continue
-        cluster = int(item["cluster"])
-        group = safe_filename_part(group_key or f"gruppe_{cluster}")
-        groups.setdefault(group, []).append(cluster)
-
-    geoms, total = make_exact_partition(
-        label_img=label_img,
-        groups=groups,
-        mm_per_px=mm_per_px,
-        min_area_px=min_area_px,
+    """Build a raster preview from the exact same vector geometry as STL export."""
+    prepared = _prepare_partition_geometry(
+        image_path=image_path,
+        color_plan=color_plan,
+        target_mode="manual",
+        manual_width_mm=manual_width_mm,
+        manual_height_mm=manual_height_mm,
+        keep_aspect=keep_aspect,
+        detect_colors=detect_colors,
+        background_mode=background_mode,
+        white_threshold=white_threshold,
+        working_pixels=working_pixels,
+        geometry_pixels=geometry_pixels,
         min_area_mm2=min_area_mm2,
         simplify_mm=simplify_mm,
         close_strength=close_strength,
+        auto_merge=auto_merge,
+        merge_distance=merge_distance,
         contour_mode=contour_mode,
-        explicit_background_mask=explicit_background_mask,
         edge_smoothing_mm=edge_smoothing_mm,
+        label_override=label_override,
+        manual_background_mask=manual_background_mask,
     )
 
-    # Optional non-proportional sizing. Existing/default keep_aspect=True behavior
-    # is unchanged; only an explicitly disabled aspect lock uses Logo Höhe.
-    render_h = ih
-    if not keep_aspect and manual_height_mm is not None and float(manual_height_mm) > 0:
-        target_y_mm_per_px = float(manual_height_mm) / max(1, ih)
-        y_factor = target_y_mm_per_px / max(1e-12, mm_per_px)
-        if abs(y_factor - 1.0) > 1e-9:
-            geoms = {name: scale_geom(g, xfact=1.0, yfact=y_factor, origin=(0, 0)) for name, g in geoms.items()}
-            total = scale_geom(total, xfact=1.0, yfact=y_factor, origin=(0, 0))
-        render_h = max(1, int(round(float(manual_height_mm) / max(1e-12, mm_per_px))))
+    geoms = prepared["geoms"]
+    total = prepared["total"]
+    label_img = prepared["label_img"]
 
-    rgba = np.zeros((render_h, iw, 4), dtype=np.uint8)
+    minx, miny, maxx, maxy = total.bounds
+    final_w_mm = float(maxx - minx)
+    final_h_mm = float(maxy - miny)
+
+    # Rasterize only the final STL bounds. Source-image padding is intentionally
+    # excluded so the preview corresponds to the physical STL dimensions.
+    target_px = max(200, int(geometry_pixels or 1600))
+    px_per_mm = target_px / max(final_w_mm, final_h_mm, 1e-12)
+    render_w = max(2, int(round(final_w_mm * px_per_mm)) + 1)
+    render_h = max(2, int(round(final_h_mm * px_per_mm)) + 1)
+
+    rgba = np.zeros((render_h, render_w, 4), dtype=np.uint8)
     masks = {}
 
     def geom_to_mask(geom):
-        mask = np.zeros((render_h, iw), dtype=np.uint8)
+        mask = np.zeros((render_h, render_w), dtype=np.uint8)
         for poly in iter_polygons(geom):
             ext = np.asarray([
-                [round(x / mm_per_px), round(render_h - y / mm_per_px)]
+                [
+                    round((x - minx) * px_per_mm),
+                    round((maxy - y) * px_per_mm),
+                ]
                 for x, y in poly.exterior.coords
             ], dtype=np.int32)
             if len(ext) >= 3:
                 cv2.fillPoly(mask, [ext], 255)
+
             for ring in poly.interiors:
                 hole = np.asarray([
-                    [round(x / mm_per_px), round(render_h - y / mm_per_px)]
+                    [
+                        round((x - minx) * px_per_mm),
+                        round((maxy - y) * px_per_mm),
+                    ]
                     for x, y in ring.coords
                 ], dtype=np.int32)
                 if len(hole) >= 3:
@@ -1457,14 +1667,14 @@ def build_partition_preview(
         rgba[mask, :3] = np.asarray(rgb, dtype=np.uint8)
         rgba[mask, 3] = 255
 
-    total_mask = geom_to_mask(total) if total is not None and not total.is_empty else np.zeros((render_h, iw), dtype=bool)
+    total_mask = geom_to_mask(total)
 
-    union_groups = unary_union(list(geoms.values())).buffer(0) if geoms else MultiPolygon([])
-    missing_area = float(total.difference(union_groups).area) if total is not None and not total.is_empty else 0.0
+    union_groups = unary_union(list(geoms.values())).buffer(0)
+    missing_area = float(total.difference(union_groups).area)
     overlap_area = max(
         0.0,
-        float(sum(g.area for g in geoms.values()) - union_groups.area)
-    ) if geoms else 0.0
+        float(sum(g.area for g in geoms.values()) - union_groups.area),
+    )
 
     return {
         "rgba": rgba,
@@ -1473,7 +1683,11 @@ def build_partition_preview(
         "geoms": geoms,
         "total": total,
         "label_img": label_img,
-        "mm_per_px": mm_per_px,
+        "mm_per_px": 1.0 / px_per_mm,
+        "vectorization_mm_per_px": prepared["vectorization_mm_per_px"],
+        "content_aspect": prepared["content_aspect"],
+        "final_width_mm": final_w_mm,
+        "final_height_mm": final_h_mm,
         "missing_area_mm2": missing_area,
         "overlap_area_mm2": overlap_area,
     }
@@ -1514,79 +1728,53 @@ def generate_logo_stls(
     out_dir.mkdir(parents=True, exist_ok=True)
     project = safe_filename_part(project_name)
     manifold_warnings = []
-    raster_path = prepare_input_image(image_path, out_dir, project, working_pixels)
-    save_input_copies(image_path, out_dir, project)
-    analysis = analyze_colors(raster_path, working_pixels, detect_colors, background_mode, white_threshold, auto_merge, merge_distance)
-    if label_override is not None:
-        label_img = np.asarray(label_override, dtype=analysis["label_img"].dtype).copy()
-        if label_img.shape != analysis["label_img"].shape:
-            raise ValueError("Manuelle Bearbeitung hat eine andere Bildgröße als die Analyse.")
-    else:
-        label_img = analysis["label_img"].copy()
 
-    label_img, color_plan, explicit_background_mask = extract_background_groups(label_img, color_plan)
+    height_mm = float(height_mm)
+    cut_depth_mm = float(cut_depth_mm)
+    clearance_mm = float(clearance_mm)
+    if not np.isfinite(height_mm) or height_mm <= 0:
+        raise ValueError("Part Height must be greater than 0 mm.")
+    if not np.isfinite(cut_depth_mm) or cut_depth_mm <= 0:
+        raise ValueError("Cutout Depth must be greater than 0 mm.")
+    if not np.isfinite(clearance_mm) or clearance_mm < 0:
+        raise ValueError("Clearance must be 0 mm or greater.")
 
-    if manual_background_mask is not None:
-        manual_bg = np.asarray(manual_background_mask, dtype=bool)
-        if manual_bg.shape != label_img.shape:
-            raise ValueError("Manuelle Hintergrundmaske hat eine andere Bildgröße als die Analyse.")
-        explicit_background_mask = explicit_background_mask | manual_bg
-        label_img[manual_bg] = -1
-
-    label_img, color_plan = redistribute_auto_groups(label_img, color_plan)
-    label_img, explicit_background_mask = upscale_geometry_grid(
-        label_img, explicit_background_mask, geometry_pixels
+    raster_path = prepare_input_image(
+        Path(image_path), out_dir, project, working_pixels
     )
-    rgba = analysis["rgba"]
-    ih, iw = label_img.shape
-    aspect = iw / ih
-    width_mm = compute_logo_width(aspect, target_mode, manual_width_mm, deck_width_mm, deck_height_mm, margin_mm, fit_percent)
-    mm_per_px = width_mm / iw
-    min_area_px = max(1, int(min_area_mm2 / (mm_per_px ** 2)))
+    save_input_copies(Path(image_path), out_dir, project)
 
-    groups = {}
-    cluster_to_rgb = {}
-    for item in color_plan:
-        if not item.get("enabled", True):
-            continue
-        cluster = int(item["cluster"])
-        group = safe_filename_part(item.get("group") or item.get("name") or f"gruppe_{cluster}")
-        groups.setdefault(group, []).append(cluster)
-        cluster_to_rgb[cluster] = item.get("rgb", [120,120,120])
-
-    # Build one common, gap-free partition instead of vectorizing colors
-    # independently. This guarantees that all color STLs exactly fill the total.
-    geoms, total = make_exact_partition(
-        label_img=label_img,
-        groups=groups,
-        mm_per_px=mm_per_px,
-        min_area_px=min_area_px,
+    prepared = _prepare_partition_geometry(
+        image_path=raster_path,
+        color_plan=color_plan,
+        target_mode=target_mode,
+        manual_width_mm=manual_width_mm,
+        manual_height_mm=manual_height_mm,
+        keep_aspect=keep_aspect,
+        deck_width_mm=deck_width_mm,
+        deck_height_mm=deck_height_mm,
+        margin_mm=margin_mm,
+        fit_percent=fit_percent,
+        detect_colors=detect_colors,
+        background_mode=background_mode,
+        white_threshold=white_threshold,
+        working_pixels=working_pixels,
+        geometry_pixels=geometry_pixels,
         min_area_mm2=min_area_mm2,
         simplify_mm=simplify_mm,
         close_strength=close_strength,
+        auto_merge=auto_merge,
+        merge_distance=merge_distance,
         contour_mode=contour_mode,
-        explicit_background_mask=explicit_background_mask,
         edge_smoothing_mm=edge_smoothing_mm,
+        label_override=label_override,
+        manual_background_mask=manual_background_mask,
     )
 
-    if not keep_aspect and manual_height_mm is not None and float(manual_height_mm) > 0:
-        target_y_mm_per_px = float(manual_height_mm) / max(1, ih)
-        y_factor = target_y_mm_per_px / max(1e-12, mm_per_px)
-        if abs(y_factor - 1.0) > 1e-9:
-            geoms = {name: scale_geom(g, xfact=1.0, yfact=y_factor, origin=(0, 0)) for name, g in geoms.items()}
-            total = scale_geom(total, xfact=1.0, yfact=y_factor, origin=(0, 0))
-
-    if not geoms or total.is_empty:
-        raise ValueError("Keine aktiven Farbflächen erzeugt. Prüfe Farbauswahl.")
-
-    # Für den zusätzlichen SVG Export pro Gruppe eine repräsentative Farbe merken.
-    group_color_meta = {}
-    for item in color_plan:
-        if not item.get("enabled", True):
-            continue
-        group = safe_filename_part(item.get("group") or item.get("name") or f"gruppe_{item['cluster']}")
-        if group not in group_color_meta:
-            group_color_meta[group] = item.get("rgb", [160, 160, 160])
+    label_img = prepared["label_img"]
+    color_plan = prepared["plan"]
+    geoms = prepared["geoms"]
+    total = prepared["total"]
 
     # `total` comes from the solid outer silhouette. The group pieces form an
     # exact partition of it. Keep this master instead of rebuilding from colors.
@@ -1642,7 +1830,7 @@ def generate_logo_stls(
     for item in color_plan:
         if item.get("enabled", True):
             preview_colors[int(item["cluster"])] = item.get("rgb", [120,120,120])
-    preview_name = f"{project}_vorschau.png"
+    preview_name = f"{project}_preview.png"
     make_preview(label_img, preview_colors, out_dir / preview_name)
 
     minx,miny,maxx,maxy = total.bounds
@@ -1658,6 +1846,13 @@ def generate_logo_stls(
         "manifold_warnings": manifold_warnings,
         "settings": {
             "working_pixels": working_pixels,
+            "geometry_pixels": geometry_pixels,
+            "requested_logo_width_mm": float(manual_width_mm),
+            "requested_logo_height_mm": (
+                float(manual_height_mm)
+                if manual_height_mm is not None else None
+            ),
+            "lock_aspect_ratio": bool(keep_aspect),
             "simplify_mm": simplify_mm,
             "clearance_mm": clearance_mm,
             "height_mm": height_mm,

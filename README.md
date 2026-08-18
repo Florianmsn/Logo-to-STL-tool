@@ -2,112 +2,125 @@
 
 A Windows desktop application for converting raster logos into separate STL files for multi-color 3D printing.
 
-The tool detects colors, lets you group and manually correct them, previews the final STL geometry, and exports one STL per print color together with matching cutout / clearance geometry.
+The tool detects colors, lets you group and manually correct them, previews the final vector geometry, and exports one STL per print color together with matching cutout and clearance geometry.
 
 ## Current Version
 
-**v7.8**
+**V8 Final / v8.0**
 
-## Features
+## Main Features
 
-- Load PNG, JPG, JPEG, WEBP, and BMP logos
+- PNG, JPG, JPEG, WEBP and BMP input
 - Automatic color detection and grouping
-- Assign detected shades to print colors
-- `AUTO` mode for anti-aliased / transitional pixels
-- `BG` mode for true background regions
-- Manual pixel-level editor:
-  - Brush
-  - Line
-  - Fill Area
-  - Eyedropper
-  - Undo
-  - Reset
-- Zoom and pan in the manual editor
+- Manual assignment of detected shades to print-color groups
+- `AUTO` for anti-aliased / transitional pixels
+- `BG` for true background regions
+- Manual editor with Brush, Line, Fill Area and Eyedropper
+- Undo, Reset, zoom and pan
 - Real-time responsive brush painting
-- Adjustable geometry resolution and contour smoothing
-- STL geometry preview before export
-- Integrity preview for the complete color partition
-- Mouse-wheel scrolling in the STL Preview
-- Separate STL export for each print color
+- Adjustable geometry resolution and edge smoothing
+- Straight, smooth and maximum-detail contour modes
+- STL geometry preview and integrity check
+- Mouse-wheel scrolling in settings, detected colors and STL Preview
+- Separate STL export for every print color
 - Complete cutout STL
 - Negative / clearance STL
 - Automatic project-specific output folder
-- English UI and output filenames
+- Compact-display friendly layout
 
-## V7.8 Manual Editor Performance
+## V8 Final — Exact STL Dimensions
 
-V7.8 changes how brush painting is displayed and applied.
+`Logo Width (mm)` and `Logo Height (mm)` now describe the **final STL footprint**, not the complete raster-image canvas.
 
-Earlier versions rebuilt and rescaled the complete Manual preview for almost every mouse-move event. Large analysis images could therefore stutter even though the expensive `Calculate` / STL processing had not started yet.
+Transparent or removed margins around a source image therefore no longer make the exported logo smaller than the requested value.
 
-V7.8 now uses two lightweight mechanisms while painting:
+### Lock aspect ratio enabled
 
-1. the editable label data is updated immediately using only a **small local region around the current brush segment**,
-2. a lightweight Canvas stroke shows the painted color **live while the mouse moves**.
+- Entering a new **Width** automatically updates **Height**
+- Entering a new **Height** automatically updates **Width**
+- Scaling remains proportional
+- Width is applied exactly to the final vector/STL geometry
+- After final vectorization, Height is synchronized to the actual proportional final height
 
-The complete Manual bitmap is rebuilt only once when the brush stroke ends.
+### Lock aspect ratio disabled
 
-Fast mouse movements are also connected as continuous brush segments, so the stroke does not leave accidental gaps between individual mouse events.
+Width and Height are independent and both are applied exactly to the final STL geometry.
 
-### Calculate Behavior Is Unchanged
+The STL Preview shows the calculated physical footprint directly, for example:
 
-Manual edits are still draft-only until **Calculate** is pressed.
+```text
+Final Geometry — 80.00 × 39.90 mm
+```
 
-While painting:
+## V8 Final — Stability Improvements
 
-- the Manual tab updates immediately,
-- the draft label data changes immediately,
-- the other previews and STL export continue to use the last calculated state.
+The complete workflow was reviewed for the V8 release.
 
-When **Calculate** is pressed:
+Notable changes:
 
-- all Manual edits are committed,
-- AUTO regions are resolved,
-- Edit / STL / Final Preview use the newly calculated result.
+- Width / Height edits invalidate STL geometry correctly
+- Preview and export use the same shared geometry-preparation path
+- Analysis settings are remembered from the analysis that produced the current label map
+- Changing analysis controls does not silently reinterpret an older analysis; changes take effect after **Analyze Colors**
+- Selecting a new image clears old analysis, Manual and STL state
+- Background workers no longer read Tkinter variables directly
+- Worker results are passed back through a main-thread UI queue
+- Duplicate/conflicting analysis, preview and export jobs are guarded
+- Physical and analysis inputs receive additional validation
+- Profiles apply Width / Height atomically so aspect-lock traces cannot overwrite profile values
+- Local output folders are no longer stored inside reusable profiles
 
-## V7.8 STL Preview Scrolling
+For backward compatibility, the existing settings directory is intentionally retained:
 
-The **STL Preview** tab can now be scrolled with the mouse wheel.
+```text
+~/.logo_inlay_tool/
+```
 
-Mouse-wheel scrolling also works while the pointer is over dynamically generated:
+This preserves existing profiles and settings after the application rename.
 
-- preview images,
-- group cards,
-- labels,
-- integrity-check sections.
+## Manual Editing
 
-The normal scrollbar remains available.
+Brush painting is displayed immediately while dragging without rebuilding and rescaling the complete Manual bitmap for every mouse event.
 
-## V7.7 Geometry Improvement
+The editable label map is updated through small local regions, while a lightweight Canvas stroke provides immediate visual feedback.
 
-V7.7 improved how microscopic gaps created during contour simplification are assigned.
+`Calculate` behavior remains deliberate:
 
-Instead of assigning the entire vectorization remainder to the globally largest color, leftover regions are assigned to the most plausible locally adjacent / locally matching color.
+- Manual edits stay local/draft-only while editing
+- Other previews and STL export continue to use the last calculated state
+- `Calculate` commits Manual changes
+- AUTO regions are resolved when `Calculate` is pressed
 
-This reduces thin wrong-color artifacts and unnecessary islands while preserving:
+## Local Color-Aware STL Partitioning
 
-- gap-free color partitioning,
-- non-overlapping color regions,
-- exact shared STL boundaries.
+Microscopic vectorization gaps are assigned to the most plausible locally adjacent color instead of being given to the globally largest color.
+
+This reduces thin wrong-color artifacts around lettering while preserving:
+
+- gap-free color partitioning
+- non-overlapping color regions
+- shared STL boundaries
 
 ## Compact Display Support
 
-- **Quick Workflow** can be collapsed
-- visible **DRAG TO RESIZE PREVIEW / COLORS** grip
-- draggable divider between logo preview and detected-color list
-- logo preview automatically scales to the available space
-- complete logo remains visible instead of being cropped
-- left settings column is vertically scrollable
-- mouse-wheel scrolling works on the left settings column
-- mouse-wheel scrolling works in the detected-color list
+The Edit tab includes:
 
-### Default Expanded Sections
+- collapsible **Quick Workflow**
+- visible **DRAG TO RESIZE PREVIEW / COLORS** grip
+- draggable divider between preview and detected colors
+- automatically resizing logo preview
+- scrollable detected-color list
+- mouse-wheel scrolling
+
+The complete left settings column is also vertically scrollable.
+
+### Open by default
 
 - File & Export
 - Logo & Analysis
 - Color Analysis
 
-### Default Collapsed Sections
+### Collapsed by default
 
 - Profile
 - Target Surface & Fit
@@ -115,13 +128,14 @@ This reduces thin wrong-color artifacts and unnecessary islands while preserving
 
 ## Typical Workflow
 
-1. Load a logo and click **(Start) Analyze Colors**.
-2. Assign detected colors to the desired print groups.
-3. Use **AUTO** for transition / anti-aliasing shades when useful.
-4. Open **Manual** and make any required corrections.
-5. Click **Calculate** to commit Manual changes and resolve AUTO pixels.
-6. Review the geometry in **STL Preview**.
-7. Click **(Finish) Generate STLs**.
+1. Load a logo
+2. Click **(Start) Analyze Colors**
+3. Assign detected colors to print groups
+4. Use `AUTO` for transition / anti-aliasing shades when useful
+5. Open **Manual** and make corrections
+6. Click **Calculate**
+7. Review **STL Preview**
+8. Click **(Finish) Generate STLs**
 
 ## Output Example
 
@@ -129,10 +143,12 @@ For a project named `Monopoly`:
 
 ```text
 Monopoly_STL/
-├── Monopoly_color_01_black.stl
-├── Monopoly_color_02_white.stl
-├── Monopoly_complete_cutout.stl
-└── Monopoly_negative_clearance_0_00mm.stl
+├── monopoly_color_01_black.stl
+├── monopoly_color_02_white.stl
+├── monopoly_complete_cutout.stl
+├── monopoly_negative_clearance_0_00mm.stl
+├── monopoly_preview.png
+└── monopoly_info.json
 ```
 
 The exporter performs topology checks. If a remaining mesh issue is detected, the STL is still written and the application reports that slicer repair may be required.
@@ -151,7 +167,7 @@ Install dependencies:
 python -m pip install -r requirements.txt
 ```
 
-Start the application:
+Run:
 
 ```bash
 python logo_inlay_app.py
@@ -174,16 +190,24 @@ build_exe.bat
 PyInstaller creates:
 
 ```text
-dist/Logo to STL Tool 7.8.exe
+dist/Logo to STL Tool 8.0.exe
 ```
 
-The compiled executable can be run on another Windows PC without a separate Python installation.
+The compiled executable can then be copied to another Windows PC without requiring a separate Python installation.
+
+## Testing
+
+V8 Final received a broad automated regression pass covering the main Core and GUI workflows.
+
+See [TEST_REPORT_V8_FINAL.md](TEST_REPORT_V8_FINAL.md).
+
+The automated suite measured approximately **74% statement coverage** across the application and core modules. Coverage is useful as a regression metric, but it is not a guarantee that software can never contain a bug.
 
 ## Development
 
 Created by **Florian Hesse** with development assistance from **ChatGPT by OpenAI**.
 
-ChatGPT was used for code generation, debugging, UI refinement, geometry logic, regression testing, and workflow development.
+ChatGPT was used for code generation, debugging, UI refinement, geometry logic, regression testing and workflow development.
 
 ## License
 

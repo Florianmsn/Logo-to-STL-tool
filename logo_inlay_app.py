@@ -2,6 +2,7 @@
 import json
 import os
 import threading
+import queue
 import traceback
 import re
 import colorsys
@@ -20,7 +21,7 @@ except ImportError:
     from logo_inlay_core import closest_color_name as guess_color_name
 
 
-APP_TITLE = "Logo to STL Tool 7.8"
+APP_TITLE = "Logo to STL Tool 8.0"
 MANUAL_AUTO_LABEL = -2147483000
 APP_DIR = Path.home() / ".logo_inlay_tool"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -182,7 +183,7 @@ DEFAULT_PROFILES = {
 }
 
 TIP = {
-    "target": "Final logo size in millimeters. With Lock aspect ratio enabled, the width controls the proportional size. If disabled, width and height are applied independently.",
+    "target": "Final STL footprint in millimeters. Width always sets the exact final STL width. With Lock aspect ratio enabled, Height follows automatically. If disabled, Width and Height are applied independently and exactly.",
     "colors": "Number of colors to detect in the source image. Higher values can capture more shades, but may also detect anti-aliasing and compression artifacts as separate colors.",
     "height": "Height of the printable logo/inlay parts in millimeters.",
     "cut": "Depth of the cutout / negative body. For a flush insert, this is usually the same as the part height.",
@@ -412,6 +413,19 @@ class App(tk.Tk):
         self.keep_aspect = tk.BooleanVar(value=self.settings.get("keep_aspect", True))
         self.detect_colors = tk.IntVar(value=self.settings.get("detect_colors", 4))
 
+        # Final STL size synchronization.
+        self._size_sync_guard = False
+        self._size_preview_job = None
+        try:
+            _saved_w = float(self.target_w.get())
+            _saved_h = float(self.target_h.get())
+            self._logo_aspect_ratio = (
+                _saved_w / _saved_h
+                if _saved_w > 0 and _saved_h > 0 else None
+            )
+        except Exception:
+            self._logo_aspect_ratio = None
+
         self.height = tk.DoubleVar(value=self.settings.get("height", 0.8))
         self.cut = tk.DoubleVar(value=self.settings.get("cut", 0.8))
         self.clearance = tk.DoubleVar(value=self.settings.get("clearance", 0.0))
@@ -476,22 +490,319 @@ class App(tk.Tk):
         self._manual_line_preview_id = None
         self.final_preview_dirty = True
         self.final_preview_busy = False
+        self.analysis_busy = False
+        self.generate_busy = False
+
+        # Background workers never call Tk directly. They post callbacks into
+        # this queue, which is drained only by the main Tk thread.
+        self._closing = False
+        self._ui_queue = queue.Queue()
+        self._ui_queue_after_id = None
 
         self.project.trace_add("write", self._project_name_changed)
         self.update_auto_output_folder()
         self.build_ui()
         self.bind_auto_preview_updates()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._ui_queue_after_id = self.after(
+            25, self._drain_ui_queue
+        )
 
         if self.image_path.get() and Path(self.image_path.get()).exists():
             self.show_original_preview(Path(self.image_path.get()))
+            self._refresh_logo_aspect_ratio(sync_locked=True)
 
     def bind_auto_preview_updates(self):
-        for var in [self.target_w, self.target_h, self.keep_aspect, self.deckel_w, self.deckel_h, self.deck_color]:
+        """Bind UI updates for physical size and target-surface preview."""
+        self.target_w.trace_add("write", self._on_target_width_changed)
+        self.target_h.trace_add("write", self._on_target_height_changed)
+        self.keep_aspect.trace_add("write", self._on_aspect_lock_changed)
+
+        for var in [self.deckel_w, self.deckel_h, self.deck_color]:
             try:
-                var.trace_add("write", lambda *args: self.update_deck_preview())
+                var.trace_add(
+                    "write",
+                    lambda *args: self.update_deck_preview()
+                )
             except Exception:
                 pass
+
+    def _safe_var_float(self, variable, default=None):
+        try:
+            value = float(variable.get())
+            if np.isfinite(value):
+                return value
+        except Exception:
+            pass
+        return default
+
+    def _current_printable_mask(self, label_img=None):
+        """Return the current committed printable footprint.
+
+        This is used only for aspect-ratio/display calculations. Manual draft
+        edits do not affect the final size until Calculate is pressed.
+        """
+        if label_img is None:
+            label_img = self.get_effective_label_img()
+        if label_img is None:
+            return None
+
+        labels = np.asarray(label_img)
+        if not self.color_rows:
+            mask = labels >= 0
+        else:
+            printable_clusters = []
+            for item in self.get_color_plan():
+                if not item.get("enabled", True):
+                    continue
+                group = str(item.get("group", "")).strip().lower()
+                if group == "zu hintergrund":
+                    continue
+                printable_clusters.append(int(item["cluster"]))
+
+            if not printable_clusters:
+                return np.zeros(labels.shape, dtype=bool)
+            mask = np.isin(labels, printable_clusters)
+
+        bg = self.get_effective_background_mask()
+        if bg is not None and np.asarray(bg).shape == labels.shape:
+            mask &= ~np.asarray(bg, dtype=bool)
+        return mask
+
+    def _aspect_from_mask(self, mask):
+        if mask is None:
+            return None
+        ys, xs = np.nonzero(np.asarray(mask, dtype=bool))
+        if len(xs) == 0:
+            return None
+        width = int(xs.max()) - int(xs.min()) + 1
+        height = int(ys.max()) - int(ys.min()) + 1
+        if width <= 0 or height <= 0:
+            return None
+        return float(width) / float(height)
+
+    def _source_image_aspect(self):
+        """Best-effort aspect before color analysis.
+
+        Transparent padding is ignored when alpha information is available.
+        """
+        path_text = self.image_path.get().strip()
+        if not path_text:
+            return None
+        try:
+            img = Image.open(path_text).convert("RGBA")
+            arr = np.asarray(img)
+            alpha = arr[:, :, 3] > 10
+            aspect = self._aspect_from_mask(alpha)
+            if aspect:
+                return aspect
+            w, h = img.size
+            return float(w) / max(1.0, float(h))
+        except Exception:
+            return None
+
+    def _refresh_logo_aspect_ratio(self, sync_locked=True):
+        aspect = None
+        if self.analysis is not None:
+            aspect = self._aspect_from_mask(self._current_printable_mask())
+        if not aspect:
+            aspect = self._source_image_aspect()
+        if not aspect:
+            w = self._safe_var_float(self.target_w)
+            h = self._safe_var_float(self.target_h)
+            if w and h and w > 0 and h > 0:
+                aspect = w / h
+
+        if aspect and np.isfinite(aspect) and aspect > 0:
+            self._logo_aspect_ratio = float(aspect)
+            if sync_locked and bool(self.keep_aspect.get()):
+                self._sync_height_from_width()
+        return self._logo_aspect_ratio
+
+    def _sync_height_from_width(self):
+        if self._size_sync_guard:
+            return
+        aspect = self._logo_aspect_ratio
+        width = self._safe_var_float(self.target_w)
+        if not aspect or not width or width <= 0:
+            return
+        height = width / aspect
+        if not np.isfinite(height) or height <= 0:
+            return
+
+        current = self._safe_var_float(self.target_h)
+        if current is not None and abs(current - height) < 0.0005:
+            return
+
+        self._size_sync_guard = True
+        try:
+            self.target_h.set(round(height, 3))
+        finally:
+            self._size_sync_guard = False
+
+    def _sync_width_from_height(self):
+        if self._size_sync_guard:
+            return
+        aspect = self._logo_aspect_ratio
+        height = self._safe_var_float(self.target_h)
+        if not aspect or not height or height <= 0:
+            return
+        width = height * aspect
+        if not np.isfinite(width) or width <= 0:
+            return
+
+        current = self._safe_var_float(self.target_w)
+        if current is not None and abs(current - width) < 0.0005:
+            return
+
+        self._size_sync_guard = True
+        try:
+            self.target_w.set(round(width, 3))
+        finally:
+            self._size_sync_guard = False
+
+    def _mark_size_changed(self):
+        self.mark_preview_dirty()
+        self.update_deck_preview()
+        self._schedule_size_preview_refresh()
+
+    def _on_target_width_changed(self, *args):
+        if self._size_sync_guard:
+            return
+        if bool(self.keep_aspect.get()):
+            if not self._logo_aspect_ratio:
+                self._refresh_logo_aspect_ratio(sync_locked=False)
+            self._sync_height_from_width()
+        self._mark_size_changed()
+
+    def _on_target_height_changed(self, *args):
+        if self._size_sync_guard:
+            return
+        if bool(self.keep_aspect.get()):
+            if not self._logo_aspect_ratio:
+                self._refresh_logo_aspect_ratio(sync_locked=False)
+            self._sync_width_from_height()
+        self._mark_size_changed()
+
+    def _on_aspect_lock_changed(self, *args):
+        if self._size_sync_guard:
+            return
+        if bool(self.keep_aspect.get()):
+            self._refresh_logo_aspect_ratio(sync_locked=False)
+            self._sync_height_from_width()
+        self._mark_size_changed()
+
+    def _schedule_size_preview_refresh(self):
+        """Refresh STL Preview after size editing when that tab is visible."""
+        if self._size_preview_job is not None:
+            try:
+                self.after_cancel(self._size_preview_job)
+            except Exception:
+                pass
+        self._size_preview_job = self.after(
+            350, self._refresh_stl_after_size_change
+        )
+
+    def _refresh_stl_after_size_change(self):
+        self._size_preview_job = None
+        if not self.analysis or self.manual_changes_pending:
+            return
+        try:
+            tab_text = self.notebook.tab(
+                self.notebook.select(), "text"
+            )
+        except Exception:
+            return
+        if tab_text == "STL Preview":
+            self.start_final_preview(force=True)
+
+    def _apply_final_geometry_size_to_ui(self, data):
+        """Keep the locked Height field equal to the actual vector result."""
+        if not bool(self.keep_aspect.get()):
+            return
+
+        try:
+            width = float(data.get("final_width_mm", 0.0))
+            height = float(data.get("final_height_mm", 0.0))
+        except Exception:
+            return
+        if width <= 0 or height <= 0:
+            return
+
+        self._logo_aspect_ratio = width / height
+        self._size_sync_guard = True
+        try:
+            self.target_h.set(round(height, 3))
+        finally:
+            self._size_sync_guard = False
+        self.update_deck_preview()
+
+    def validate_final_size_settings(self, for_export=False, show_errors=True):
+        """Validate physical dimensions before vector preview/export."""
+
+        def fail(title, text):
+            if show_errors:
+                messagebox.showerror(title, text)
+            return False
+
+        width = self._safe_var_float(self.target_w)
+        if width is None or width <= 0:
+            return fail(
+                "Invalid Logo Size",
+                "Logo Width must be greater than 0 mm."
+            )
+
+        if bool(self.keep_aspect.get()):
+            self._refresh_logo_aspect_ratio(sync_locked=False)
+            self._sync_height_from_width()
+
+        height = self._safe_var_float(self.target_h)
+        if height is None or height <= 0:
+            return fail(
+                "Invalid Logo Size",
+                "Logo Height must be greater than 0 mm."
+            )
+
+        geometry_pixels = self._safe_var_float(self.geometry_pixels)
+        min_area = self._safe_var_float(self.min_area)
+        simplify = self._safe_var_float(self.smooth)
+        if geometry_pixels is None or geometry_pixels < 100:
+            return fail(
+                "Invalid Geometry Setting",
+                "Geometry Resolution must be at least 100 px."
+            )
+        if min_area is None or min_area < 0:
+            return fail(
+                "Invalid Geometry Setting",
+                "Min. Island Area must be 0 mm² or greater."
+            )
+        if simplify is None or simplify < 0:
+            return fail(
+                "Invalid Geometry Setting",
+                "Contour Simplification must be 0 mm or greater."
+            )
+
+        if for_export:
+            part_height = self._safe_var_float(self.height)
+            cut_depth = self._safe_var_float(self.cut)
+            clearance = self._safe_var_float(self.clearance)
+            if part_height is None or part_height <= 0:
+                return fail(
+                    "Invalid STL Setting",
+                    "Part Height must be greater than 0 mm."
+                )
+            if cut_depth is None or cut_depth <= 0:
+                return fail(
+                    "Invalid STL Setting",
+                    "Cutout Depth must be greater than 0 mm."
+                )
+            if clearance is None or clearance < 0:
+                return fail(
+                    "Invalid STL Setting",
+                    "Clearance must be 0 mm or greater."
+                )
+        return True
+
 
     def load_profiles(self):
         if PROFILES_FILE.exists():
@@ -566,9 +877,45 @@ class App(tk.Tk):
     def save_settings(self):
         SETTINGS_FILE.write_text(json.dumps(self.current_settings(), indent=2, ensure_ascii=False), encoding="utf-8")
 
+    def _post_ui(self, callback, *args, **kwargs):
+        """Queue a UI callback from a background worker without touching Tk."""
+        if self._closing:
+            return
+        self._ui_queue.put((callback, args, kwargs))
+
+    def _drain_ui_queue(self):
+        if self._closing:
+            return
+        try:
+            while True:
+                callback, args, kwargs = self._ui_queue.get_nowait()
+                try:
+                    callback(*args, **kwargs)
+                except Exception:
+                    # Keep the queue alive even if one UI callback fails.
+                    traceback.print_exc()
+        except queue.Empty:
+            pass
+
+        if not self._closing:
+            try:
+                self._ui_queue_after_id = self.after(
+                    25, self._drain_ui_queue
+                )
+            except Exception:
+                self._ui_queue_after_id = None
+
     def on_close(self):
+        self._closing = True
+        if self._ui_queue_after_id is not None:
+            try:
+                self.after_cancel(self._ui_queue_after_id)
+            except Exception:
+                pass
+            self._ui_queue_after_id = None
         self.save_settings()
         self.destroy()
+
 
     def build_ui(self):
         main = ttk.Frame(self, padding=8)
@@ -628,7 +975,17 @@ class App(tk.Tk):
         std = std_sec.body
         self.row_entry(std, "Logo Width (mm)", self.target_w, TIP["target"])
         self.row_entry(std, "Logo Height (mm)", self.target_h, TIP["target"])
-        ttk.Checkbutton(std, text="Lock aspect ratio", variable=self.keep_aspect).pack(anchor="w")
+        ttk.Checkbutton(
+            std, text="Lock aspect ratio", variable=self.keep_aspect
+        ).pack(anchor="w")
+        ttk.Label(
+            std,
+            text=(
+                "Width / Height describe the final STL footprint. "
+                "Transparent or removed source-image margins are ignored."
+            ),
+            wraplength=330,
+        ).pack(fill="x", pady=(2, 4))
         self.row_entry(std, "Colors to detect", self.detect_colors, TIP["colors"])
         brow = ttk.Frame(std)
         brow.pack(fill="x", pady=(6, 0))
@@ -1014,7 +1371,14 @@ class App(tk.Tk):
 
     def apply_geometry_settings(self):
         if not self.analysis:
-            messagebox.showinfo("No Analysis", "Please click (Start) Analyze Colors first.")
+            messagebox.showinfo(
+                "No Analysis",
+                "Please click (Start) Analyze Colors first."
+            )
+            return
+        if not self.validate_final_size_settings(
+            for_export=False, show_errors=True
+        ):
             return
         self.mark_preview_dirty()
         self.status.set(
@@ -1030,9 +1394,9 @@ class App(tk.Tk):
         self.after(50, lambda: self.start_final_preview(force=True))
 
     def sanitized_project_folder_name(self):
-        name = str(self.project.get()).strip() or "Projekt"
+        name = str(self.project.get()).strip() or "Project"
         name = re.sub(r'[<>:"/\\|?*]+', "_", name)
-        name = name.rstrip(" .") or "Projekt"
+        name = name.rstrip(" .") or "Project"
         return f"{name}_STL"
 
     def update_auto_output_folder(self):
@@ -1043,7 +1407,54 @@ class App(tk.Tk):
     def _project_name_changed(self, *args):
         self.update_auto_output_folder()
 
+    def clear_analysis_state(self):
+        """Clear all result state when a different source image is selected."""
+        self.analysis = None
+        self._analysis_params_used = None
+        self.color_rows = []
+        self._highlighted = None
+
+        self.manual_label_img = None
+        self.manual_background_mask = None
+        self.committed_manual_label_img = None
+        self.committed_manual_background_mask = None
+        self.manual_undo.clear()
+        self.set_manual_pending(False)
+
+        self.final_preview_dirty = True
+        self.final_preview_busy = False
+
+        if hasattr(self, "colors_inner"):
+            for child in self.colors_inner.winfo_children():
+                child.destroy()
+        if hasattr(self, "group_status"):
+            self.group_status.set("No colors detected yet.")
+        if hasattr(self, "manual_canvas"):
+            self.manual_canvas.delete("all")
+            self.manual_canvas.create_text(
+                20, 20, anchor="nw",
+                text="Analyze colors first."
+            )
+        if hasattr(self, "stl_scroll"):
+            for child in self.stl_scroll.inner.winfo_children():
+                child.destroy()
+        if hasattr(self, "final_preview_status"):
+            self.final_preview_status.set(
+                "STL Preview is generated from the final vector geometry."
+            )
+        if hasattr(self, "deck_preview"):
+            self.deck_preview.configure(image="", text="Analyze colors first.")
+            self.deckel_photo = None
+
     def choose_image(self):
+        if self.analysis_busy or self.generate_busy or self.final_preview_busy:
+            messagebox.showinfo(
+                "Please Wait",
+                "A calculation is currently running. Please wait until it finishes "
+                "before selecting another image."
+            )
+            return
+
         p = filedialog.askopenfilename(
             title="Select Image",
             filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")]
@@ -1056,6 +1467,7 @@ class App(tk.Tk):
         self.image_path.set(str(path))
         self.project.set(path.stem)
         self.update_auto_output_folder()
+        self.clear_analysis_state()
         self.show_original_preview(path)
         self.status.set("Image loaded. Click (Start) Analyze Colors to continue.")
         self.save_settings()
@@ -1173,34 +1585,126 @@ class App(tk.Tk):
         self._render_preview_source()
 
     def start_analyze(self):
-        if not self.image_path.get():
-            messagebox.showwarning("No Image", "Please select an image first.")
+        if self.analysis_busy:
             return
-        self.status.set("Analyzing colors...")
-        threading.Thread(target=self.analyze_worker, daemon=True).start()
-
-    def analyze_worker(self):
-        try:
-            self.analysis = analyze_colors(
-                Path(self.image_path.get()),
-                working_pixels=int(self.working_pixels.get()),
-                detect_colors=int(self.detect_colors.get()),
-                background_mode=self.background.get(),
-                white_threshold=int(self.white_threshold.get()),
-                auto_merge=bool(self.auto_merge.get()),
-                merge_distance=float(self.merge_distance.get()),
+        if self.generate_busy or self.final_preview_busy:
+            messagebox.showinfo(
+                "Please Wait",
+                "Another geometry calculation is currently running."
             )
-            self.after(0, self.render_colors)
+            return
+
+        image_path = self.image_path.get().strip()
+        if not image_path:
+            messagebox.showwarning(
+                "No Image", "Please select an image first."
+            )
+            return
+
+        try:
+            params = {
+                "image_path": Path(image_path),
+                "working_pixels": int(self.working_pixels.get()),
+                "detect_colors": int(self.detect_colors.get()),
+                "background_mode": self.background.get(),
+                "white_threshold": int(self.white_threshold.get()),
+                "auto_merge": bool(self.auto_merge.get()),
+                "merge_distance": float(self.merge_distance.get()),
+                "out_dir": Path(self.out_dir.get())
+                if self.out_dir.get().strip() else None,
+            }
+        except Exception:
+            messagebox.showerror(
+                "Invalid Analysis Setting",
+                "Please check the Color Analysis values."
+            )
+            return
+
+        if params["working_pixels"] < 100:
+            messagebox.showerror(
+                "Invalid Analysis Setting",
+                "Analysis Resolution must be at least 100 px."
+            )
+            return
+        if params["detect_colors"] < 1:
+            messagebox.showerror(
+                "Invalid Analysis Setting",
+                "Colors to detect must be at least 1."
+            )
+            return
+        if not 0 <= params["white_threshold"] <= 255:
+            messagebox.showerror(
+                "Invalid Analysis Setting",
+                "White Threshold must be between 0 and 255."
+            )
+            return
+        if params["merge_distance"] < 0:
+            messagebox.showerror(
+                "Invalid Analysis Setting",
+                "Color Distance must be 0 or greater."
+            )
+            return
+
+        self.analysis_busy = True
+        self.status.set("Analyzing colors...")
+        threading.Thread(
+            target=self.analyze_worker,
+            args=(params,),
+            daemon=True,
+        ).start()
+
+    def analyze_worker(self, params):
+        try:
+            result = analyze_colors(
+                params["image_path"],
+                working_pixels=params["working_pixels"],
+                detect_colors=params["detect_colors"],
+                background_mode=params["background_mode"],
+                white_threshold=params["white_threshold"],
+                auto_merge=params["auto_merge"],
+                merge_distance=params["merge_distance"],
+            )
+            self._post_ui(
+                self._finish_analysis_success, result, params
+            )
         except Exception as e:
             detail = traceback.format_exc()
-            try:
-                log_path = Path(self.out_dir.get()) / "logo_inlay_error.log"
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                log_path.write_text(detail, encoding="utf-8")
-            except Exception:
-                pass
-            self.after(0, lambda: messagebox.showerror("Color Analysis Error", f"{e}\n\nSee logo_inlay_error.log in the output folder for details."))
-            self.after(0, lambda: self.status.set("Color analysis failed."))
+            if params.get("out_dir"):
+                try:
+                    log_path = params["out_dir"] / "logo_inlay_error.log"
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    log_path.write_text(detail, encoding="utf-8")
+                except Exception:
+                    pass
+            self._post_ui(
+                self._finish_analysis_error, str(e)
+            )
+
+    def _finish_analysis_success(self, result, params):
+        self.analysis_busy = False
+        self.analysis = result
+        self._analysis_params_used = {
+            key: params[key]
+            for key in (
+                "working_pixels",
+                "detect_colors",
+                "background_mode",
+                "white_threshold",
+                "auto_merge",
+                "merge_distance",
+            )
+        }
+        self._analysis_auto_merge_used = bool(params["auto_merge"])
+        self.render_colors()
+
+    def _finish_analysis_error(self, error_text):
+        self.analysis_busy = False
+        messagebox.showerror(
+            "Color Analysis Error",
+            f"{error_text}\n\n"
+            "See logo_inlay_error.log in the output folder for details."
+        )
+        self.status.set("Color analysis failed.")
 
     def group_preview_rgb(self, group_name, fallback_rgb=None):
         key = (group_name or "").strip().lower()
@@ -1256,7 +1760,9 @@ class App(tk.Tk):
             name = better_color_name(rgb)
             cluster_id = c["cluster"]
 
-            if self.auto_merge.get():
+            if getattr(
+                self, "_analysis_auto_merge_used", bool(self.auto_merge.get())
+            ):
                 default_group = name
             else:
                 name_counts[name] = name_counts.get(name, 0) + 1
@@ -1286,6 +1792,7 @@ class App(tk.Tk):
                 lbl.set(f"→ {display_group_name(g.get())}")
                 self.mark_preview_dirty()
                 self.update_group_preview()
+                self._refresh_logo_aspect_ratio(sync_locked=True)
 
             enabled.trace_add("write", changed)
             group.trace_add("write", changed)
@@ -1321,6 +1828,7 @@ class App(tk.Tk):
         self.update_group_status()
         self.update_group_preview()
         self.update_manual_preview()
+        self._refresh_logo_aspect_ratio(sync_locked=True)
         self.mark_preview_dirty()
 
     def assign_selected_to_named_group(self, group_name):
@@ -1339,6 +1847,7 @@ class App(tk.Tk):
             self.refresh_manual_targets()
             self.mark_preview_dirty()
             self.update_group_preview()
+            self._refresh_logo_aspect_ratio(sync_locked=True)
             self.status.set("Selected color assigned to background.")
             return
 
@@ -1351,6 +1860,7 @@ class App(tk.Tk):
         self.refresh_manual_targets()
         self.mark_preview_dirty()
         self.update_group_preview()
+        self._refresh_logo_aspect_ratio(sync_locked=True)
         self.status.set(f"Selected color assigned to group {display_group_name(group_name)}.")
 
     def toggle_highlight(self, cluster_id):
@@ -1469,7 +1979,7 @@ class App(tk.Tk):
     def commit_manual_edit(self, refresh_other_tabs=False):
         """Keep the manual draft local until the user presses Calculate.
 
-        V7.8: this method deliberately does not rebuild the Manual bitmap.
+        V8.0: this method deliberately does not rebuild the Manual bitmap.
         Brush/Line/Fill already update their own visible draft. Calculate is
         still the only action that publishes Manual changes to other tabs.
         """
@@ -1672,6 +2182,7 @@ class App(tk.Tk):
                 self.committed_manual_background_mask = None
 
             self.set_manual_pending(False)
+            self._refresh_logo_aspect_ratio(sync_locked=True)
             self.mark_preview_dirty()
 
             # Update all dependent views only now.
@@ -1902,7 +2413,7 @@ class App(tk.Tk):
 
         Earlier versions allocated an image-sized mask for every mouse event.
         On large analysis images that made the brush stutter even though no
-        Calculate/STL processing was running. V7.8 allocates only the bounding
+        Calculate/STL processing was running. V8.0 allocates only the bounding
         rectangle around the current stroke segment.
         """
         import cv2
@@ -2192,64 +2703,163 @@ class App(tk.Tk):
         elif tab_text == "Final Preview":
             self.update_deck_preview()
 
+    def _analysis_settings_for_processing(self):
+        """Return the settings that created the current label map.
+
+        Changes in the Color Analysis controls only take effect after the user
+        clicks Analyze Colors again. Preview/export therefore use the settings
+        of the current analysis, preventing shape/cluster mismatches.
+        """
+        used = getattr(self, "_analysis_params_used", None)
+        if used:
+            return dict(used)
+        return {
+            "working_pixels": int(self.working_pixels.get()),
+            "detect_colors": int(self.detect_colors.get()),
+            "background_mode": self.background.get(),
+            "white_threshold": int(self.white_threshold.get()),
+            "auto_merge": bool(self.auto_merge.get()),
+            "merge_distance": float(self.merge_distance.get()),
+        }
+
     def start_final_preview(self, force=False):
         if not self.analysis or self.final_preview_busy:
             return
+        if self.analysis_busy or self.generate_busy:
+            self.final_preview_status.set(
+                "STL Preview is waiting for the current calculation to finish."
+            )
+            return
+
         if self.manual_changes_pending:
             self.final_preview_status.set(
                 "Manual contains changes that have not been calculated yet. "
                 "Open Manual and click Calculate first."
             )
             return
+
         if not self.final_preview_dirty and not force:
             return
-        self.final_preview_busy = True
-        self.final_preview_status.set("Calculating final vector geometry…")
-        threading.Thread(target=self.final_preview_worker, daemon=True).start()
 
-    def final_preview_worker(self):
-        try:
-            color_map = {}
-            for item in self.get_color_plan():
-                g = str(item["group"]).strip()
-                safe = re.sub(r'[^A-Za-z0-9._-]+', '_', g).strip('_') or 'group'
-                color_map[safe] = self.group_preview_rgb(g, item["rgb"])
-
-            data = build_partition_preview(
-                image_path=Path(self.image_path.get()),
-                color_plan=self.get_color_plan(),
-                manual_width_mm=float(self.target_w.get()),
-                manual_height_mm=float(self.target_h.get()),
-                keep_aspect=bool(self.keep_aspect.get()),
-                detect_colors=int(self.detect_colors.get()),
-                background_mode=self.background.get(),
-                white_threshold=int(self.white_threshold.get()),
-                working_pixels=int(self.working_pixels.get()),
-                geometry_pixels=int(self.geometry_pixels.get()),
-                min_area_mm2=float(self.min_area.get()),
-                simplify_mm=float(self.smooth.get()),
-                close_strength=0,
-                auto_merge=bool(self.auto_merge.get()),
-                merge_distance=float(self.merge_distance.get()),
-                contour_mode=self.contour_mode.get(),
-                edge_smoothing_mm=self.edge_smoothing_mm(),
-                label_override=self.get_effective_label_img(),
-                manual_background_mask=self.get_effective_background_mask(),
-                group_colors=color_map,
+        if not self.validate_final_size_settings(
+            for_export=False, show_errors=False
+        ):
+            self.final_preview_status.set(
+                "STL Preview is waiting for a valid Logo Width / Height."
             )
-            data["_ui_geometry_settings"] = {
-                "smoothing_name": self.edge_smoothing.get(),
-                "smoothing_mm": self.edge_smoothing_mm(),
+            return
+
+        try:
+            color_plan = self.get_color_plan()
+            color_map = {}
+            for item in color_plan:
+                group = str(item["group"]).strip()
+                safe = re.sub(
+                    r"[^A-Za-z0-9._-]+", "_", group
+                ).strip("_") or "group"
+                color_map[safe] = self.group_preview_rgb(
+                    group, item["rgb"]
+                )
+
+            analysis_used = self._analysis_settings_for_processing()
+            params = {
+                "image_path": Path(self.image_path.get()),
+                "color_plan": color_plan,
+                "manual_width_mm": float(self.target_w.get()),
+                "manual_height_mm": float(self.target_h.get()),
+                "keep_aspect": bool(self.keep_aspect.get()),
+                "detect_colors": int(analysis_used["detect_colors"]),
+                "background_mode": analysis_used["background_mode"],
+                "white_threshold": int(analysis_used["white_threshold"]),
+                "working_pixels": int(analysis_used["working_pixels"]),
                 "geometry_pixels": int(self.geometry_pixels.get()),
+                "min_area_mm2": float(self.min_area.get()),
                 "simplify_mm": float(self.smooth.get()),
-                "contour_mode": self.contour_display.get(),
+                "close_strength": 0,
+                "auto_merge": bool(analysis_used["auto_merge"]),
+                "merge_distance": float(analysis_used["merge_distance"]),
+                "contour_mode": self.contour_mode.get(),
+                "edge_smoothing_mm": self.edge_smoothing_mm(),
+                "label_override": (
+                    self.get_effective_label_img().copy()
+                    if self.get_effective_label_img() is not None
+                    else None
+                ),
+                "manual_background_mask": (
+                    self.get_effective_background_mask().copy()
+                    if self.get_effective_background_mask() is not None
+                    else None
+                ),
+                "group_colors": color_map,
+                "_ui_color_plan": [
+                    {
+                        **item,
+                        "rgb": list(item.get("rgb", [160, 160, 160])),
+                    }
+                    for item in color_plan
+                ],
+                "_ui_geometry_settings": {
+                    "smoothing_name": self.edge_smoothing.get(),
+                    "smoothing_mm": self.edge_smoothing_mm(),
+                    "geometry_pixels": int(self.geometry_pixels.get()),
+                    "simplify_mm": float(self.smooth.get()),
+                    "contour_mode": self.contour_display.get(),
+                },
             }
-            self.after(0, lambda d=data: self.render_final_preview(d))
-        except Exception as e:
-            detail = traceback.format_exc()
-            self.after(0, lambda: self.final_preview_status.set(f"Preview error: {e}"))
+        except Exception as exc:
+            self.final_preview_status.set(
+                f"Preview settings error: {exc}"
+            )
+            return
+
+        self.final_preview_busy = True
+        self.final_preview_status.set(
+            "Calculating final vector geometry…"
+        )
+        threading.Thread(
+            target=self.final_preview_worker,
+            args=(params,),
+            daemon=True,
+        ).start()
+
+    def final_preview_worker(self, params):
+        try:
+            data = build_partition_preview(
+                image_path=params["image_path"],
+                color_plan=params["color_plan"],
+                manual_width_mm=params["manual_width_mm"],
+                manual_height_mm=params["manual_height_mm"],
+                keep_aspect=params["keep_aspect"],
+                detect_colors=params["detect_colors"],
+                background_mode=params["background_mode"],
+                white_threshold=params["white_threshold"],
+                working_pixels=params["working_pixels"],
+                geometry_pixels=params["geometry_pixels"],
+                min_area_mm2=params["min_area_mm2"],
+                simplify_mm=params["simplify_mm"],
+                close_strength=params["close_strength"],
+                auto_merge=params["auto_merge"],
+                merge_distance=params["merge_distance"],
+                contour_mode=params["contour_mode"],
+                edge_smoothing_mm=params["edge_smoothing_mm"],
+                label_override=params["label_override"],
+                manual_background_mask=params["manual_background_mask"],
+                group_colors=params["group_colors"],
+            )
+            data["_ui_geometry_settings"] = params[
+                "_ui_geometry_settings"
+            ]
+            data["_ui_color_plan"] = params["_ui_color_plan"]
+            self._post_ui(self.render_final_preview, data)
+        except Exception as exc:
+            self._post_ui(
+                self._set_final_preview_error, str(exc)
+            )
         finally:
-            self.after(0, self.finish_final_preview)
+            self._post_ui(self.finish_final_preview)
+
+    def _set_final_preview_error(self, error_text):
+        self.final_preview_status.set(f"Preview error: {error_text}")
 
     def finish_final_preview(self):
         self.final_preview_busy = False
@@ -2258,16 +2868,25 @@ class App(tk.Tk):
         for child in self.stl_scroll.inner.winfo_children():
             child.destroy()
 
+        self._apply_final_geometry_size_to_ui(data)
+
         rgba = data["rgba"]
         settings = data.get("_ui_geometry_settings", {})
+        final_w = float(data.get("final_width_mm", 0.0))
+        final_h = float(data.get("final_height_mm", 0.0))
         title = (
-            "Final Geometry — "
+            f"Final Geometry — {final_w:.2f} × {final_h:.2f} mm — "
             f"{settings.get('smoothing_name', '?')} / "
             f"{settings.get('smoothing_mm', 0):.2f} mm / "
             f"{settings.get('geometry_pixels', '?')} px"
         )
-        total = ttk.LabelFrame(self.stl_scroll.inner, text=title, padding=8)
-        total.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=6)
+        total = ttk.LabelFrame(
+            self.stl_scroll.inner, text=title, padding=8
+        )
+        total.grid(
+            row=0, column=0, columnspan=2,
+            sticky="ew", padx=8, pady=6
+        )
 
         # Checker background for transparency
         h, w = rgba.shape[:2]
@@ -2278,58 +2897,106 @@ class App(tk.Tk):
         missing = float(data.get("missing_area_mm2", 0.0))
         overlap = float(data.get("overlap_area_mm2", 0.0))
         if missing < 1e-6 and overlap < 1e-6:
-            partition_status = "Integrity check: OK — no missing area and no overlap."
+            partition_status = (
+                "Integrity check: OK — no missing area and no overlap."
+            )
         else:
-            partition_status = f"Integrity check: missing {missing:.6f} mm² | overlap {overlap:.6f} mm²"
+            partition_status = (
+                f"Integrity check: missing {missing:.6f} mm² | "
+                f"overlap {overlap:.6f} mm²"
+            )
 
         self.add_preview_card(
             total,
             comp,
+            f"Final STL footprint: {final_w:.3f} × {final_h:.3f} mm\n"
             "This preview uses the same vector partition as the STL export.\n"
             + partition_status,
             max_size=(520, 340)
         )
 
-        fill_card = ttk.LabelFrame(self.stl_scroll.inner, text="Integrity Check — All Colors as One Body", padding=8)
-        fill_card.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=6)
+        fill_card = ttk.LabelFrame(
+            self.stl_scroll.inner,
+            text="Integrity Check — All Colors as One Body",
+            padding=8
+        )
+        fill_card.grid(
+            row=1, column=0, columnspan=2,
+            sticky="ew", padx=8, pady=6
+        )
         fill_img = self.make_checker(h, w)
-        fill_img[data["total_mask"]] = np.asarray([60, 150, 80], dtype=np.uint8)
+        fill_img[data["total_mask"]] = np.asarray(
+            [60, 150, 80], dtype=np.uint8
+        )
         self.add_preview_card(
             fill_card,
             fill_img,
-            "All active color regions are intentionally shown as one solid color here. "
-            "Only true background should remain transparent / checkerboard."
+            "All active color regions are intentionally shown as one solid "
+            "color here. Only true background should remain transparent / "
+            "checkerboard."
         )
 
         group_masks = data["group_masks"]
-        total_pixels = max(1, sum(int(np.sum(m)) for m in group_masks.values()))
+        total_pixels = max(
+            1, sum(int(np.sum(m)) for m in group_masks.values())
+        )
+        preview_plan = data.get("_ui_color_plan", self.get_color_plan())
+
         for idx, (group, mask) in enumerate(group_masks.items()):
             arr = self.make_checker(h, w)
             rgb = None
-            for item in self.get_color_plan():
-                safe = re.sub(r'[^A-Za-z0-9._-]+', '_', str(item["group"])).strip('_') or 'group'
+            for item in preview_plan:
+                safe = re.sub(
+                    r"[^A-Za-z0-9._-]+",
+                    "_",
+                    str(item["group"])
+                ).strip("_") or "group"
                 if safe == group:
-                    rgb = self.group_preview_rgb(str(item["group"]), item["rgb"])
+                    rgb = self.group_preview_rgb(
+                        str(item["group"]), item["rgb"]
+                    )
                     break
             if rgb is None:
                 rgb = [160, 160, 160]
+
             arr[mask] = np.asarray(rgb, dtype=np.uint8)
-            percent = round(100 * int(np.sum(mask)) / total_pixels, 1)
+            percent = round(
+                100 * int(np.sum(mask)) / total_pixels, 1
+            )
             islands = self.count_islands(mask)
-            card = ttk.LabelFrame(self.stl_scroll.inner, text=f"Group: {display_group_name(group)}", padding=8)
-            card.grid(row=2 + idx // 2, column=idx % 2, sticky="nsew", padx=8, pady=6)
-            self.add_preview_card(card, arr, f"Area: {percent} %\nIslands: {islands}")
+            card = ttk.LabelFrame(
+                self.stl_scroll.inner,
+                text=f"Group: {display_group_name(group)}",
+                padding=8
+            )
+            card.grid(
+                row=2 + idx // 2,
+                column=idx % 2,
+                sticky="nsew",
+                padx=8,
+                pady=6
+            )
+            self.add_preview_card(
+                card,
+                arr,
+                f"Area: {percent} %\nIslands: {islands}"
+            )
 
         self.stl_scroll.inner.columnconfigure(0, weight=1)
         self.stl_scroll.inner.columnconfigure(1, weight=1)
 
         # Cards are rebuilt dynamically, so bind wheel scrolling again after
-        # every STL-preview render. Scrolling works while the pointer is over
-        # images, labels or group cards, not only over the scrollbar itself.
-        self.stl_scroll.bind_mousewheel_recursive(self.stl_scroll.inner)
+        # every STL-preview render.
+        self.stl_scroll.bind_mousewheel_recursive(
+            self.stl_scroll.inner
+        )
 
         self.final_preview_dirty = False
-        self.final_preview_status.set("Final geometry preview is up to date.")
+        self.final_preview_status.set(
+            f"Final geometry preview is up to date — "
+            f"{final_w:.3f} × {final_h:.3f} mm."
+        )
+
 
     def count_islands(self, mask):
         try:
@@ -2383,37 +3050,60 @@ class App(tk.Tk):
     def update_deck_preview(self):
         if not self.analysis:
             return
+
         label_img = self.get_effective_label_img()
-        h, w = label_img.shape
+        if label_img is None:
+            return
+
+        target_w = self._safe_var_float(self.target_w)
+        target_h = self._safe_var_float(self.target_h)
+        deck_w = self._safe_var_float(self.deckel_w)
+        deck_h = self._safe_var_float(self.deckel_h)
+        if (
+            target_w is None or target_h is None
+            or deck_w is None or deck_h is None
+            or target_w <= 0 or target_h <= 0
+            or deck_w <= 0 or deck_h <= 0
+        ):
+            return
 
         deck_rgb = self.parse_hex_color(self.deck_color.get())
         logo = self.logo_array_on_background(label_img, deck_rgb)
 
+        # Crop away non-printing source-image margins. Logo Width / Height refer
+        # to the final STL footprint, not to the original raster canvas.
+        active = self._current_printable_mask(label_img)
+        if active is None or not np.any(active):
+            return
+        ys, xs = np.nonzero(active)
+        x0c, x1c = int(xs.min()), int(xs.max()) + 1
+        y0c, y1c = int(ys.min()), int(ys.max()) + 1
+        logo = logo[y0c:y1c, x0c:x1c]
+
         canvas_w, canvas_h = 760, 480
-        deck_w = max(1.0, float(self.deckel_w.get()))
-        deck_h = max(1.0, float(self.deckel_h.get()))
-        scale = min((canvas_w - 80) / deck_w, (canvas_h - 80) / deck_h)
+        scale = min(
+            (canvas_w - 80) / max(1.0, deck_w),
+            (canvas_h - 80) / max(1.0, deck_h),
+        )
         dw, dh = int(deck_w * scale), int(deck_h * scale)
 
         bg = np.ones((canvas_h, canvas_w, 3), dtype=np.uint8) * 238
-        x0, y0 = (canvas_w - dw)//2, (canvas_h - dh)//2
-        bg[y0:y0+dh, x0:x0+dw] = np.array(deck_rgb, dtype=np.uint8)
-        bg[y0:y0+2, x0:x0+dw] = 80
-        bg[y0+dh-2:y0+dh, x0:x0+dw] = 80
-        bg[y0:y0+dh, x0:x0+2] = 80
-        bg[y0:y0+dh, x0+dw-2:x0+dw] = 80
+        x0, y0 = (canvas_w - dw) // 2, (canvas_h - dh) // 2
+        bg[y0:y0 + dh, x0:x0 + dw] = np.array(deck_rgb, dtype=np.uint8)
+        bg[y0:y0 + 2, x0:x0 + dw] = 80
+        bg[y0 + dh - 2:y0 + dh, x0:x0 + dw] = 80
+        bg[y0:y0 + dh, x0:x0 + 2] = 80
+        bg[y0:y0 + dh, x0 + dw - 2:x0 + dw] = 80
 
-        target_w = float(self.target_w.get())
-        target_h = float(self.target_h.get())
-        if self.keep_aspect.get():
-            target_h = target_w / (w / max(1, h))
+        lw = max(1, int(round(target_w * scale)))
+        lh = max(1, int(round(target_h * scale)))
 
-        lw, lh = max(1, int(target_w * scale)), max(1, int(target_h * scale))
-        logo_img = Image.fromarray(logo).convert("RGBA")
-        if self.keep_aspect.get():
-            logo_img.thumbnail((lw, lh), Image.Resampling.LANCZOS)
-        else:
-            logo_img = logo_img.resize((lw, lh), Image.Resampling.LANCZOS)
+        # The two fields are the final physical dimensions. With aspect lock on
+        # target_h is synchronized automatically; with it off both dimensions
+        # intentionally scale independently.
+        logo_img = Image.fromarray(logo).convert("RGBA").resize(
+            (lw, lh), Image.Resampling.LANCZOS
+        )
 
         bg_img = Image.fromarray(bg).convert("RGBA")
         lx = x0 + (dw - logo_img.size[0]) // 2
@@ -2424,9 +3114,22 @@ class App(tk.Tk):
         self.deck_preview.configure(image=self.deckel_photo, text="")
 
     def start_generate(self):
-        if not self.analysis:
-            messagebox.showwarning("No Analysis", "Please click (Start) Analyze Colors first.")
+        if self.generate_busy:
             return
+        if self.analysis_busy or self.final_preview_busy:
+            messagebox.showinfo(
+                "Please Wait",
+                "Another analysis or geometry calculation is currently running."
+            )
+            return
+
+        if not self.analysis:
+            messagebox.showwarning(
+                "No Analysis",
+                "Please click (Start) Analyze Colors first."
+            )
+            return
+
         if self.manual_changes_pending:
             ok = messagebox.askyesno(
                 "Manual Changes Not Calculated",
@@ -2438,118 +3141,224 @@ class App(tk.Tk):
             if not self.calculate_manual_result():
                 return
 
+        if not self.validate_final_size_settings(
+            for_export=True, show_errors=True
+        ):
+            return
+
         group_count, groups = self.active_groups_count()
+        if group_count <= 0:
+            messagebox.showerror(
+                "No Printable Groups",
+                "No active print-color group is available for STL export."
+            )
+            return
+
         if group_count > 4:
             ok = messagebox.askyesno(
                 "Many Color Groups",
-                f"You created {group_count} active print groups:\n{', '.join(display_group_name(g) for g in groups)}\n\n"
+                f"You created {group_count} active print groups:\n"
+                f"{', '.join(display_group_name(g) for g in groups)}\n\n"
                 "A typical AMS handles up to 4 colors at once. Export anyway?"
             )
             if not ok:
                 return
-        self.status.set("Generating STLs...")
-        threading.Thread(target=self.generate_worker, daemon=True).start()
 
-    def generate_worker(self):
-        try:
-            meta = generate_logo_stls(
-                image_path=Path(self.image_path.get()),
-                out_dir=Path(self.out_dir.get()),
-                project_name=self.project.get(),
-                color_plan=self.get_color_plan(),
-                target_mode="manual",
-                manual_width_mm=float(self.target_w.get()),
-                manual_height_mm=float(self.target_h.get()),
-                keep_aspect=bool(self.keep_aspect.get()),
-                deck_width_mm=float(self.deckel_w.get()),
-                deck_height_mm=float(self.deckel_h.get()),
-                margin_mm=0.0,
-                fit_percent=100.0,
-                height_mm=float(self.height.get()),
-                cut_depth_mm=float(self.cut.get()),
-                clearance_mm=float(self.clearance.get()),
-                detect_colors=int(self.detect_colors.get()),
-                background_mode=self.background.get(),
-                white_threshold=int(self.white_threshold.get()),
-                working_pixels=int(self.working_pixels.get()),
-                geometry_pixels=int(self.geometry_pixels.get()),
-                min_area_mm2=float(self.min_area.get()),
-                simplify_mm=float(self.smooth.get()),
-                close_strength=0,
-                auto_merge=bool(self.auto_merge.get()),
-                merge_distance=float(self.merge_distance.get()),
-                contour_mode=self.contour_mode.get(),
-                edge_smoothing_mm=self.edge_smoothing_mm(),
-                center_output=True,
-                label_override=self.get_effective_label_img(),
-                manual_background_mask=self.get_effective_background_mask(),
+        out_text = self.out_dir.get().strip()
+        if not out_text:
+            messagebox.showerror(
+                "No Output Folder",
+                "Please choose an output folder first."
             )
-            files = meta.get("files", []) if isinstance(meta, dict) else []
-            warnings = meta.get("manifold_warnings", []) if isinstance(meta, dict) else []
+            return
 
-            if warnings:
-                def show_success_with_warning():
-                    self.status.set(
-                        f"Done. {len(files)} files created — "
-                        f"{len(warnings)} may need slicer repair."
-                    )
-                    details = "\n".join(
-                        f"• {w.get('file', '?')}: "
-                        f"{w.get('bad_edges', 0)} problematic edges "
-                        f"({w.get('boundary_edges', 0)} open)"
-                        for w in warnings
-                    )
-                    messagebox.showwarning(
-                        "Export Complete — Repair May Be Needed",
-                        f"All files were created:\n{self.out_dir.get()}\n\n"
-                        "The following STL files still contain topology warnings:\n\n"
-                        f"{details}\n\n"
-                        "If your slicer offers a repair function, you can use it as before."
-                    )
-                self.after(0, show_success_with_warning)
-            else:
-                self.after(0, lambda: self.status.set(
-                    f"Done. {len(files)} files created without manifold warnings."
-                ))
-                self.after(0, lambda: messagebox.showinfo(
-                    "Done", f"Export complete:\n{self.out_dir.get()}"
-                ))
-        except Exception as e:
+        try:
+            analysis_used = self._analysis_settings_for_processing()
+            params = {
+                "image_path": Path(self.image_path.get()),
+                "out_dir": Path(out_text),
+                "project_name": self.project.get(),
+                "color_plan": self.get_color_plan(),
+                "target_mode": "manual",
+                "manual_width_mm": float(self.target_w.get()),
+                "manual_height_mm": float(self.target_h.get()),
+                "keep_aspect": bool(self.keep_aspect.get()),
+                "deck_width_mm": float(self.deckel_w.get()),
+                "deck_height_mm": float(self.deckel_h.get()),
+                "margin_mm": 0.0,
+                "fit_percent": 100.0,
+                "height_mm": float(self.height.get()),
+                "cut_depth_mm": float(self.cut.get()),
+                "clearance_mm": float(self.clearance.get()),
+                "detect_colors": int(analysis_used["detect_colors"]),
+                "background_mode": analysis_used["background_mode"],
+                "white_threshold": int(analysis_used["white_threshold"]),
+                "working_pixels": int(analysis_used["working_pixels"]),
+                "geometry_pixels": int(self.geometry_pixels.get()),
+                "min_area_mm2": float(self.min_area.get()),
+                "simplify_mm": float(self.smooth.get()),
+                "close_strength": 0,
+                "auto_merge": bool(analysis_used["auto_merge"]),
+                "merge_distance": float(analysis_used["merge_distance"]),
+                "contour_mode": self.contour_mode.get(),
+                "edge_smoothing_mm": self.edge_smoothing_mm(),
+                "center_output": True,
+                "label_override": (
+                    self.get_effective_label_img().copy()
+                    if self.get_effective_label_img() is not None
+                    else None
+                ),
+                "manual_background_mask": (
+                    self.get_effective_background_mask().copy()
+                    if self.get_effective_background_mask() is not None
+                    else None
+                ),
+            }
+        except Exception as exc:
+            messagebox.showerror(
+                "Invalid Export Setting", str(exc)
+            )
+            return
+
+        self.generate_busy = True
+        self.status.set("Generating STLs...")
+        threading.Thread(
+            target=self.generate_worker,
+            args=(params,),
+            daemon=True,
+        ).start()
+
+    def generate_worker(self, params):
+        try:
+            meta = generate_logo_stls(**params)
+            self._post_ui(
+                self._finish_generate_success,
+                meta,
+                params["out_dir"],
+            )
+        except Exception as exc:
             detail = traceback.format_exc()
             try:
-                log_path = Path(self.out_dir.get()) / "logo_inlay_error.log"
+                log_path = params["out_dir"] / "logo_inlay_error.log"
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 log_path.write_text(detail, encoding="utf-8")
             except Exception:
                 pass
-            self.after(0, lambda: messagebox.showerror("Export Error", f"{e}\n\nSee logo_inlay_error.log in the output folder for details."))
-            self.after(0, lambda: self.status.set("Export failed."))
+            self._post_ui(
+                self._finish_generate_error, str(exc)
+            )
+
+    def _finish_generate_success(self, meta, out_dir):
+        self.generate_busy = False
+        files = meta.get("files", []) if isinstance(meta, dict) else []
+        warnings = (
+            meta.get("manifold_warnings", [])
+            if isinstance(meta, dict) else []
+        )
+
+        final_w = meta.get("final_logo_width_mm")
+        final_h = meta.get("final_logo_height_mm")
+        size_text = ""
+        if final_w is not None and final_h is not None:
+            size_text = (
+                f"\nFinal STL size: {final_w} × {final_h} mm"
+            )
+
+        if warnings:
+            self.status.set(
+                f"Done. {len(files)} files created — "
+                f"{len(warnings)} may need slicer repair."
+            )
+            details = "\n".join(
+                f"• {w.get('file', '?')}: "
+                f"{w.get('bad_edges', 0)} problematic edges "
+                f"({w.get('boundary_edges', 0)} open)"
+                for w in warnings
+            )
+            messagebox.showwarning(
+                "Export Complete — Repair May Be Needed",
+                f"All files were created:\n{out_dir}{size_text}\n\n"
+                "The following STL files still contain topology warnings:\n\n"
+                f"{details}\n\n"
+                "If your slicer offers a repair function, you can use it."
+            )
+        else:
+            self.status.set(
+                f"Done. {len(files)} files created without manifold warnings."
+            )
+            messagebox.showinfo(
+                "Done",
+                f"Export complete:\n{out_dir}{size_text}"
+            )
+
+    def _finish_generate_error(self, error_text):
+        self.generate_busy = False
+        messagebox.showerror(
+            "Export Error",
+            f"{error_text}\n\n"
+            "See logo_inlay_error.log in the output folder for details."
+        )
+        self.status.set("Export failed.")
 
     def apply_profile(self):
         data = self.profiles.get(self.profile_name.get())
         if not data:
             return
-        for key, value in data.items():
-            if hasattr(self, key):
-                var = getattr(self, key)
-                try:
-                    var.set(value)
-                except Exception:
-                    pass
+
+        # Apply profile values atomically. Width/Height traces must not fight
+        # each other while the profile is being loaded.
+        self._size_sync_guard = True
+        try:
+            for key, value in data.items():
+                if hasattr(self, key):
+                    var = getattr(self, key)
+                    try:
+                        var.set(value)
+                    except Exception:
+                        pass
+        finally:
+            self._size_sync_guard = False
+
         self.edge_smoothing.set(
-            EDGE_SMOOTHING_MIGRATION.get(self.edge_smoothing.get(), self.edge_smoothing.get())
+            EDGE_SMOOTHING_MIGRATION.get(
+                self.edge_smoothing.get(),
+                self.edge_smoothing.get()
+            )
         )
-        self.background_display.set(BACKGROUND_INTERNAL.get(self.background.get(), "Transparent background"))
-        self.contour_display.set(CONTOUR_INTERNAL.get(self.contour_mode.get(), "Straight / crisp"))
-        self.status.set(f"Profile applied: {self.profile_name.get()}")
+        self.background_display.set(
+            BACKGROUND_INTERNAL.get(
+                self.background.get(), "Transparent background"
+            )
+        )
+        self.contour_display.set(
+            CONTOUR_INTERNAL.get(
+                self.contour_mode.get(), "Straight / crisp"
+            )
+        )
+
+        # If aspect lock is part of the profile, keep its requested width and
+        # derive Height from the current logo instead of overwriting Width.
+        self._refresh_logo_aspect_ratio(sync_locked=True)
+        self.mark_preview_dirty()
+        self.update_deck_preview()
+        self.status.set(
+            f"Profile applied: {self.profile_name.get()}"
+        )
         self.save_settings()
+
 
     def save_profile_as(self):
         name = simpledialog.askstring("Save Profile", "Name for the new profile:")
         if not name:
             return
         data = self.current_settings()
-        for remove_key in ["image_path", "out_dir", "project", "profile_name"]:
+        for remove_key in [
+            "image_path",
+            "out_dir",
+            "output_base_dir",
+            "project",
+            "profile_name",
+        ]:
             data.pop(remove_key, None)
         self.profiles[name] = data
         self.save_profiles()
