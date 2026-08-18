@@ -6,7 +6,7 @@ The tool detects colors, lets you group and manually correct them, previews the 
 
 ## Current Version
 
-**v7.7**
+**v7.8**
 
 ## Features
 
@@ -23,34 +23,74 @@ The tool detects colors, lets you group and manually correct them, previews the 
   - Undo
   - Reset
 - Zoom and pan in the manual editor
+- Real-time responsive brush painting
 - Adjustable geometry resolution and contour smoothing
 - STL geometry preview before export
 - Integrity preview for the complete color partition
+- Mouse-wheel scrolling in the STL Preview
 - Separate STL export for each print color
 - Complete cutout STL
 - Negative / clearance STL
 - Automatic project-specific output folder
 - English UI and output filenames
 
+## V7.8 Manual Editor Performance
+
+V7.8 changes how brush painting is displayed and applied.
+
+Earlier versions rebuilt and rescaled the complete Manual preview for almost every mouse-move event. Large analysis images could therefore stutter even though the expensive `Calculate` / STL processing had not started yet.
+
+V7.8 now uses two lightweight mechanisms while painting:
+
+1. the editable label data is updated immediately using only a **small local region around the current brush segment**,
+2. a lightweight Canvas stroke shows the painted color **live while the mouse moves**.
+
+The complete Manual bitmap is rebuilt only once when the brush stroke ends.
+
+Fast mouse movements are also connected as continuous brush segments, so the stroke does not leave accidental gaps between individual mouse events.
+
+### Calculate Behavior Is Unchanged
+
+Manual edits are still draft-only until **Calculate** is pressed.
+
+While painting:
+
+- the Manual tab updates immediately,
+- the draft label data changes immediately,
+- the other previews and STL export continue to use the last calculated state.
+
+When **Calculate** is pressed:
+
+- all Manual edits are committed,
+- AUTO regions are resolved,
+- Edit / STL / Final Preview use the newly calculated result.
+
+## V7.8 STL Preview Scrolling
+
+The **STL Preview** tab can now be scrolled with the mouse wheel.
+
+Mouse-wheel scrolling also works while the pointer is over dynamically generated:
+
+- preview images,
+- group cards,
+- labels,
+- integrity-check sections.
+
+The normal scrollbar remains available.
+
 ## V7.7 Geometry Improvement
 
-V7.7 changes how microscopic gaps created during contour simplification are assigned.
+V7.7 improved how microscopic gaps created during contour simplification are assigned.
 
-Earlier versions kept the color STLs gap-free by assigning the complete vectorization remainder to the globally largest color. On some logos this could create thin wrong-color lines or many tiny islands around letters and detailed boundaries.
+Instead of assigning the entire vectorization remainder to the globally largest color, leftover regions are assigned to the most plausible locally adjacent / locally matching color.
 
-V7.7 now:
+This reduces thin wrong-color artifacts and unnecessary islands while preserving:
 
-1. vectorizes every active color individually,
-2. resolves overlaps while preserving smaller detail groups,
-3. identifies only the true leftover vectorization gaps,
-4. assigns each leftover region to a **locally adjacent / locally matching color**,
-5. keeps the complete partition gap-free and non-overlapping.
-
-This significantly reduces incorrect thin color artifacts around lettering while preserving the exact shared STL boundaries.
+- gap-free color partitioning,
+- non-overlapping color regions,
+- exact shared STL boundaries.
 
 ## Compact Display Support
-
-The Edit tab is designed to work on smaller screens:
 
 - **Quick Workflow** can be collapsed
 - visible **DRAG TO RESIZE PREVIEW / COLORS** grip
@@ -78,8 +118,8 @@ The Edit tab is designed to work on smaller screens:
 1. Load a logo and click **(Start) Analyze Colors**.
 2. Assign detected colors to the desired print groups.
 3. Use **AUTO** for transition / anti-aliasing shades when useful.
-4. Open **Manual** and click **Calculate** to resolve AUTO pixels.
-5. Make any required pixel-level corrections and click **Calculate** again.
+4. Open **Manual** and make any required corrections.
+5. Click **Calculate** to commit Manual changes and resolve AUTO pixels.
 6. Review the geometry in **STL Preview**.
 7. Click **(Finish) Generate STLs**.
 
@@ -134,7 +174,7 @@ build_exe.bat
 PyInstaller creates:
 
 ```text
-dist/Logo to STL Tool 7.7.exe
+dist/Logo to STL Tool 7.8.exe
 ```
 
 The compiled executable can be run on another Windows PC without a separate Python installation.

@@ -20,7 +20,7 @@ except ImportError:
     from logo_inlay_core import closest_color_name as guess_color_name
 
 
-APP_TITLE = "Logo to STL Tool 7.7"
+APP_TITLE = "Logo to STL Tool 7.8"
 MANUAL_AUTO_LABEL = -2147483000
 APP_DIR = Path.home() / ".logo_inlay_tool"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -469,6 +469,9 @@ class App(tk.Tk):
         self.manual_pan_y = 0.0
         self._manual_pan_start = None
         self._manual_painting = False
+        self._manual_brush_last_pos = None
+        self._manual_brush_overlay_id = None
+        self._manual_brush_overlay_points = []
         self._manual_line_start = None
         self._manual_line_preview_id = None
         self.final_preview_dirty = True
@@ -966,6 +969,7 @@ class App(tk.Tk):
         self.stl_scroll.pack(fill="both", expand=True)
         self.final_preview_status = tk.StringVar(value="STL Preview is generated from the final vector geometry.")
         ttk.Label(self.stl_scroll.inner, textvariable=self.final_preview_status).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=8)
+        self.stl_scroll.bind_mousewheel_recursive(self.stl_scroll.inner)
 
         # Deck settings moved into deck tab
         deck_controls = ttk.LabelFrame(self.tab_deck, text="Target Surface", padding=8)
@@ -1463,9 +1467,13 @@ class App(tk.Tk):
         self.set_manual_pending(self.manual_changes_pending)
 
     def commit_manual_edit(self, refresh_other_tabs=False):
-        """Keep the manual draft local until the user presses Calculate."""
+        """Keep the manual draft local until the user presses Calculate.
+
+        V7.8: this method deliberately does not rebuild the Manual bitmap.
+        Brush/Line/Fill already update their own visible draft. Calculate is
+        still the only action that publishes Manual changes to other tabs.
+        """
         self.set_manual_pending(True)
-        self.update_manual_preview()
 
 
     def set_manual_target(self, target):
@@ -1728,7 +1736,13 @@ class App(tk.Tk):
             self._manual_painting = False
             self.commit_manual_edit(refresh_other_tabs=False)
         else:
-            self.manual_paint(pos)
+            # Brush painting is live, but no full image rebuild occurs here.
+            # The source label map is changed immediately while a lightweight
+            # Canvas overlay shows the stroke in real time.
+            self._manual_brush_last_pos = pos
+            self.manual_apply_brush_segment(pos, pos)
+            self.manual_start_brush_overlay(pos)
+            self.set_manual_pending(True)
 
     def manual_mouse_drag(self, event):
         tool = self.manual_tool.get()
@@ -1742,8 +1756,13 @@ class App(tk.Tk):
         if self._manual_painting and tool == "Brush":
             pos = self.manual_source_xy(event)
             if pos is not None:
-                self.manual_paint(pos, refresh=False)
-                self.update_manual_preview()
+                previous = self._manual_brush_last_pos or pos
+                if pos != previous:
+                    # Apply the complete segment, not only the newest mouse
+                    # position. Fast mouse movement therefore cannot leave gaps.
+                    self.manual_apply_brush_segment(previous, pos)
+                    self.manual_extend_brush_overlay(pos)
+                    self._manual_brush_last_pos = pos
 
     def manual_mouse_up(self, event):
         tool = self.manual_tool.get()
@@ -1759,8 +1778,22 @@ class App(tk.Tk):
             return
 
         if self._manual_painting:
+            if tool == "Brush":
+                # Capture a final mouse-up segment if the last motion event was
+                # skipped by Tk, then consolidate the live overlay into the
+                # normal Manual preview exactly once.
+                end_pos = self.manual_source_xy(event)
+                if end_pos is not None:
+                    previous = self._manual_brush_last_pos or end_pos
+                    if end_pos != previous:
+                        self.manual_apply_brush_segment(previous, end_pos)
+                        self.manual_extend_brush_overlay(end_pos)
+
             self._manual_painting = False
+            self._manual_brush_last_pos = None
             self.update_manual_preview()
+            self._manual_brush_overlay_id = None
+            self._manual_brush_overlay_points = []
             self.commit_manual_edit(refresh_other_tabs=False)
 
     def manual_target_preview_rgb(self):
@@ -1784,6 +1817,130 @@ class App(tk.Tk):
             ox + (x + 0.5) * self.manual_scale,
             oy + (y + 0.5) * self.manual_scale,
         )
+
+    def manual_clear_brush_overlay(self):
+        if (
+            self._manual_brush_overlay_id is not None
+            and hasattr(self, "manual_canvas")
+        ):
+            try:
+                self.manual_canvas.delete(self._manual_brush_overlay_id)
+            except Exception:
+                pass
+        self._manual_brush_overlay_id = None
+        self._manual_brush_overlay_points = []
+
+    def manual_start_brush_overlay(self, pos):
+        """Start one lightweight Canvas stroke for instant visual feedback."""
+        self.manual_clear_brush_overlay()
+        x, y = self.manual_canvas_xy(pos)
+        rgb = self.manual_target_preview_rgb()
+        color = "#%02x%02x%02x" % tuple(int(v) for v in rgb)
+        px = max(1, int(self.manual_brush_size.get()))
+        display_width = max(1, int(round(px * self.manual_scale)))
+
+        # A tiny second point makes a single click visible as a round dot.
+        self._manual_brush_overlay_points = [x, y, x + 0.01, y]
+        self._manual_brush_overlay_id = self.manual_canvas.create_line(
+            *self._manual_brush_overlay_points,
+            fill=color,
+            width=display_width,
+            capstyle=tk.ROUND,
+            joinstyle=tk.ROUND,
+            smooth=False,
+        )
+
+    def manual_extend_brush_overlay(self, pos):
+        """Extend the current on-screen stroke without rebuilding the bitmap."""
+        if self._manual_brush_overlay_id is None:
+            self.manual_start_brush_overlay(pos)
+            return
+        x, y = self.manual_canvas_xy(pos)
+        self._manual_brush_overlay_points.extend([x, y])
+        try:
+            self.manual_canvas.coords(
+                self._manual_brush_overlay_id,
+                *self._manual_brush_overlay_points,
+            )
+        except Exception:
+            pass
+
+    def manual_apply_local_mask(self, x0, y0, local_mask):
+        """Apply a small ROI mask directly to the editable label arrays."""
+        if self.manual_label_img is None:
+            return
+
+        local_mask = np.asarray(local_mask, dtype=bool)
+        if local_mask.size == 0 or not np.any(local_mask):
+            return
+
+        h, w = local_mask.shape
+        labels_roi = self.manual_label_img[y0:y0 + h, x0:x0 + w]
+        bg_roi = self.manual_background_mask[y0:y0 + h, x0:x0 + w]
+
+        target = self.manual_target.get().strip()
+        if not target:
+            return
+
+        if target == "zu Hintergrund":
+            bg_roi[local_mask] = True
+            return
+
+        if target == "auto verteilen":
+            labels_roi[local_mask] = MANUAL_AUTO_LABEL
+            bg_roi[local_mask] = False
+            return
+
+        cluster = self.cluster_for_group(target)
+        if cluster is None:
+            return
+        labels_roi[local_mask] = cluster
+        bg_roi[local_mask] = False
+
+    def manual_apply_brush_segment(self, start_pos, end_pos):
+        """Paint one continuous brush segment using only a small local ROI.
+
+        Earlier versions allocated an image-sized mask for every mouse event.
+        On large analysis images that made the brush stutter even though no
+        Calculate/STL processing was running. V7.8 allocates only the bounding
+        rectangle around the current stroke segment.
+        """
+        import cv2
+
+        if self.manual_label_img is None:
+            return
+
+        x1, y1 = start_pos
+        x2, y2 = end_pos
+        size = max(1, int(self.manual_brush_size.get()))
+        radius = 0 if size == 1 else max(1, int(round(size / 2.0)))
+        pad = max(2, radius + 2)
+
+        ih, iw = self.manual_label_img.shape
+        x0 = max(0, min(x1, x2) - pad)
+        y0 = max(0, min(y1, y2) - pad)
+        xr = min(iw - 1, max(x1, x2) + pad)
+        yr = min(ih - 1, max(y1, y2) + pad)
+
+        local = np.zeros((yr - y0 + 1, xr - x0 + 1), dtype=np.uint8)
+        p1 = (int(x1 - x0), int(y1 - y0))
+        p2 = (int(x2 - x0), int(y2 - y0))
+
+        if size == 1:
+            cv2.line(local, p1, p2, 1, thickness=1, lineType=cv2.LINE_8)
+        else:
+            # Match the old circular brush as closely as possible while joining
+            # successive mouse positions into a continuous stroke.
+            thickness = max(1, radius * 2)
+            cv2.line(
+                local, p1, p2, 1,
+                thickness=thickness,
+                lineType=cv2.LINE_8,
+            )
+            cv2.circle(local, p1, radius, 1, -1)
+            cv2.circle(local, p2, radius, 1, -1)
+
+        self.manual_apply_local_mask(x0, y0, local.astype(bool))
 
     def manual_clear_line_preview(self):
         if (
@@ -1852,20 +2009,8 @@ class App(tk.Tk):
         self.manual_background_mask[mask] = False
 
     def manual_paint(self, pos, refresh=True):
-        import cv2
-        x, y = pos
-        size = max(1, int(self.manual_brush_size.get()))
-        mask = np.zeros(self.manual_label_img.shape, dtype=np.uint8)
-
-        # Pinselgröße bedeutet jetzt ungefähr Durchmesser in Quellpixeln.
-        # Größe 1 ist bewusst GENAU ein einzelnes Pixel.
-        if size == 1:
-            mask[y, x] = 1
-        else:
-            radius = max(1, int(round(size / 2.0)))
-            cv2.circle(mask, (x, y), radius, 1, -1)
-
-        self.manual_apply_mask(mask.astype(bool))
+        """Compatibility helper for one brush dab."""
+        self.manual_apply_brush_segment(pos, pos)
         if refresh:
             self.update_manual_preview()
 
@@ -2026,6 +2171,9 @@ class App(tk.Tk):
         self.manual_offset = (ox, oy)
 
         self.manual_canvas.delete("all")
+        self._manual_brush_overlay_id = None
+        self._manual_brush_overlay_points = []
+        self._manual_line_preview_id = None
         self.manual_canvas.create_image(ox, oy, anchor="nw", image=self.manual_photo)
 
     def mark_preview_dirty(self):
@@ -2174,6 +2322,12 @@ class App(tk.Tk):
 
         self.stl_scroll.inner.columnconfigure(0, weight=1)
         self.stl_scroll.inner.columnconfigure(1, weight=1)
+
+        # Cards are rebuilt dynamically, so bind wheel scrolling again after
+        # every STL-preview render. Scrolling works while the pointer is over
+        # images, labels or group cards, not only over the scrollbar itself.
+        self.stl_scroll.bind_mousewheel_recursive(self.stl_scroll.inner)
+
         self.final_preview_dirty = False
         self.final_preview_status.set("Final geometry preview is up to date.")
 
