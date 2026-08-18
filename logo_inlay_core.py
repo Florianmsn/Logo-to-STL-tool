@@ -1757,6 +1757,157 @@ def _build_print_groups(color_plan: list[dict]) -> dict:
     return groups
 
 
+def cleanup_small_color_islands(
+    label_img: np.ndarray,
+    color_plan: list[dict],
+    min_area_mm2: float,
+    target_width_mm: float,
+    target_height_mm: float | None = None,
+    keep_aspect: bool = True,
+    background_mask=None,
+):
+    """Reassign tiny print-color islands in the ACTUAL label raster.
+
+    This is intentionally earlier than vectorization. It fixes the class of
+    errors where a one/few-pixel Blue, Black, Red, etc. artifact is already
+    present in Manual after color grouping / Calculate.
+
+    Rules:
+      * colors are merged by their assigned print group first;
+      * components are 4-connected;
+      * only stable colors sharing a real horizontal/vertical edge are eligible;
+      * most shared edges wins;
+      * a true tie uses local stable-color majority;
+      * diagonal/non-touching colors are never candidates;
+      * AUTO / BG / disabled colors are not used as replacement candidates;
+      * details surrounded only by background are preserved.
+
+    The physical `Min. Island Area (mm²)` setting determines how many source
+    raster pixels count as a tiny island. This same concept is also used again
+    later as a vector-geometry safety net.
+
+    Returns:
+        (cleaned_label_img, stats)
+    """
+    labels = np.asarray(label_img).copy()
+
+    try:
+        min_area = float(min_area_mm2)
+        width_mm = float(target_width_mm)
+    except Exception:
+        return labels, {
+            "changed_pixels": 0,
+            "changed_components": 0,
+            "threshold_px": 1,
+        }
+
+    if (
+        not np.isfinite(min_area)
+        or min_area <= 0
+        or not np.isfinite(width_mm)
+        or width_mm <= 0
+    ):
+        return labels, {
+            "changed_pixels": 0,
+            "changed_components": 0,
+            "threshold_px": 1,
+        }
+
+    groups = _build_print_groups(color_plan)
+    bbox = _active_content_bbox_px(labels, groups)
+    if not groups or bbox is None:
+        return labels, {
+            "changed_pixels": 0,
+            "changed_components": 0,
+            "threshold_px": 1,
+        }
+
+    _, _, _, _, content_w_px, content_h_px = bbox
+    x_mm_per_px = width_mm / max(1, content_w_px)
+
+    if keep_aspect or target_height_mm is None:
+        y_mm_per_px = x_mm_per_px
+    else:
+        try:
+            height_mm = float(target_height_mm)
+        except Exception:
+            height_mm = 0.0
+        if not np.isfinite(height_mm) or height_mm <= 0:
+            y_mm_per_px = x_mm_per_px
+        else:
+            y_mm_per_px = height_mm / max(1, content_h_px)
+
+    pixel_area_mm2 = max(1e-12, x_mm_per_px * y_mm_per_px)
+    threshold_px = max(
+        1,
+        int(np.ceil(min_area / pixel_area_mm2)),
+    )
+
+    if threshold_px <= 1:
+        return labels, {
+            "changed_pixels": 0,
+            "changed_components": 0,
+            "threshold_px": threshold_px,
+        }
+
+    names = list(groups.keys())
+    group_map = np.full(labels.shape, -1, dtype=np.int16)
+    representative_cluster = {}
+
+    for gid, name in enumerate(names):
+        cluster_ids = [int(v) for v in groups[name]]
+        if not cluster_ids:
+            continue
+        representative_cluster[gid] = cluster_ids[0]
+        group_map[np.isin(labels, cluster_ids)] = gid
+
+    if background_mask is not None:
+        bg = np.asarray(background_mask, dtype=bool)
+        if bg.shape == labels.shape:
+            group_map[bg] = -1
+
+    active_mask = group_map >= 0
+    if not np.any(active_mask):
+        return labels, {
+            "changed_pixels": 0,
+            "changed_components": 0,
+            "threshold_px": threshold_px,
+        }
+
+    cleaned_map = _reassign_tiny_raster_components(
+        group_map=group_map,
+        active_mask=active_mask,
+        min_area_px=threshold_px,
+    )
+
+    changed = active_mask & (cleaned_map != group_map)
+    changed_pixels = int(np.count_nonzero(changed))
+
+    if changed_pixels == 0:
+        return labels, {
+            "changed_pixels": 0,
+            "changed_components": 0,
+            "threshold_px": threshold_px,
+        }
+
+    count, _ = cv2.connectedComponents(
+        changed.astype(np.uint8), connectivity=4
+    )
+    changed_components = max(0, int(count) - 1)
+
+    # Convert cleaned print-group IDs back to a valid cluster ID of that group.
+    for gid, cluster_id in representative_cluster.items():
+        target = changed & (cleaned_map == gid)
+        if np.any(target):
+            labels[target] = int(cluster_id)
+
+    return labels, {
+        "changed_pixels": changed_pixels,
+        "changed_components": changed_components,
+        "threshold_px": threshold_px,
+    }
+
+
 def _active_content_bbox_px(label_img: np.ndarray, groups: dict):
     """Return (x0, y0, x1, y1, width_px, height_px) for printable pixels."""
     if not groups:
@@ -1893,7 +2044,34 @@ def _prepare_partition_geometry(
         explicit_background_mask = explicit_background_mask | manual_bg
         label_img[manual_bg] = -1
 
+    # V8.2: clean tiny already-assigned wrong-color islands BEFORE AUTO.
+    # This prevents one stray Blue/Black/Red pixel from becoming a valid AUTO
+    # seed and spreading the wrong color into a transition region.
+    if target_mode == "manual":
+        label_img, _ = cleanup_small_color_islands(
+            label_img=label_img,
+            color_plan=plan,
+            min_area_mm2=min_area_mm2,
+            target_width_mm=manual_width_mm,
+            target_height_mm=manual_height_mm,
+            keep_aspect=keep_aspect,
+            background_mask=explicit_background_mask,
+        )
+
     label_img, plan = redistribute_auto_groups(label_img, plan)
+
+    # Run the same cleanup again after AUTO. This removes any residual tiny
+    # print-color islands before geometry upscaling / smoothing.
+    if target_mode == "manual":
+        label_img, _ = cleanup_small_color_islands(
+            label_img=label_img,
+            color_plan=plan,
+            min_area_mm2=min_area_mm2,
+            target_width_mm=manual_width_mm,
+            target_height_mm=manual_height_mm,
+            keep_aspect=keep_aspect,
+            background_mask=explicit_background_mask,
+        )
 
     unresolved_auto_ids = {
         int(item["cluster"])

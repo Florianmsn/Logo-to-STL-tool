@@ -4,7 +4,7 @@ A Windows desktop application for converting raster logos into separate STL file
 
 ## Current Version
 
-**v8.1**
+**v8.2**
 
 ## Main Features
 
@@ -15,85 +15,94 @@ A Windows desktop application for converting raster logos into separate STL file
 - Manual Brush, Line, Fill Area and Eyedropper
 - Real-time responsive Manual brush
 - Undo, Reset, zoom and pan
-- Exact final STL Width / Height
-- Adjustable geometry resolution
-- Adjustable contour simplification and edge smoothing
+- Exact final STL Width / Height controls
+- Adjustable geometry resolution, smoothing and contour mode
 - STL geometry and integrity preview
 - Final Preview on a configurable target surface
-- Separate STL files for each print color
+- Separate STL export for each print color
 - Complete cutout STL
 - Negative / clearance STL
-- Compact-display layout with mouse-wheel scrolling
+- Compact-display friendly layout and mouse-wheel scrolling
 
-## V8.1 — Strict Local Color Repair
+## V8.2 — Raster Despeckle Before STL Geometry
 
-V8.1 fixes the remaining wrong-color micro-pixel / micro-island problem in the STL geometry.
+V8.2 fixes a deeper source of isolated wrong-color pixels.
 
-There are now two cleanup stages.
+Previous releases concentrated on:
 
-### 1. Raster cleanup before vectorization
+- strict AUTO adjacency
+- vector-gap ownership
+- tiny vector islands
 
-Tiny color components below `Min. Island Area` are handled before contours are created.
+Those protections happen at or after geometry generation.
 
-A tiny component may be reassigned only to a **stable print color that shares a real horizontal or vertical pixel edge with it**.
+The remaining issue could already exist **inside the calculated Manual color raster itself**: a one/few-pixel Blue, Black, Red, etc. component could survive color grouping and later become a real STL island.
 
-The decision is:
+V8.2 therefore moves the important cleanup earlier.
 
-1. count the shared pixel edges for every valid neighboring color
-2. choose the color with the highest count
-3. if the edge count is exactly tied, use the local stable-color majority around the same component
+### Calculate now performs three stages
 
-Important:
+When **Calculate** is pressed:
 
-- diagonal-only colors are not candidates
-- colors elsewhere in the logo are not candidates
-- one tiny artifact cannot pull another tiny artifact into a new color
-- a tiny detail surrounded only by true background is preserved
+1. tiny already-assigned wrong-color components are cleaned
+2. AUTO is resolved
+3. the tiny-color cleanup runs a second time
 
-### 2. Strict vector-gap filling
+The cleaned result becomes the actual committed Manual raster.
 
-Contour simplification can create microscopic geometric gaps.
+You can therefore see the correction immediately in the **Manual** tab after Calculate. STL Preview and STL export then start from the same cleaned raster.
 
-V8.1 fills them using only proven physical adjacency:
+## Strict Local Despeckle Rules
 
-1. inspect the direct 4-neighbor raster ring around the gap
-2. choose the most represented directly adjacent color
-3. if there is an exact tie, use shared vector-boundary length between those same candidates
-4. if the raster ring cannot decide, a true shared vector edge may be used
-5. if no physical adjacency can be proven, the program does **not** invent a color
+A small color component below `Min. Island Area (mm²)` can be reassigned only when another stable print color shares a real horizontal or vertical pixel edge with it.
 
-There is no longer any:
+For every tiny component:
 
-- global nearest-color fallback
-- RGB-based remote-color fallback
-- globally largest-color fallback
-- "nearby but not touching" color fallback
+1. all true 4-neighbor edge contacts are counted
+2. only directly touching stable print colors are candidates
+3. the color with the highest shared-edge count wins
+4. if the edge count is exactly tied, the local stable-color majority is used
+5. diagonal-only colors are ignored
+6. colors elsewhere in the logo are ignored
 
-If an unusual vector gap cannot be assigned locally, the application reports it instead of silently inserting the wrong color.
+A small detail surrounded only by true background is preserved.
+
+Tiny unstable components are not allowed to vote for one another, which prevents chains of noise pixels from simply changing into another wrong color.
+
+## Why the V8.1 Geometry Cleanup Was Not Enough
+
+`Min. Island Area` was already used as a geometry safety net.
+
+However, if the wrong-color pixel was visible in the Manual raster, waiting until vectorization meant:
+
+- Manual still looked wrong
+- an incorrect pixel could become an AUTO neighbor/seed
+- later smoothing and contour operations had to repair a problem that should have been removed earlier
+
+V8.2 uses the same physical island-area concept at the source-raster stage and keeps the later geometry cleanup as an additional safety net.
 
 ## AUTO Behavior
 
-AUTO remains separate from the vector-gap cleanup.
+AUTO remains strict:
 
-AUTO uses strict 4-neighbor connectivity:
-
-- only print colors sharing a real pixel edge with the connected AUTO region are valid candidates
+- only colors sharing a real horizontal/vertical pixel edge with the connected AUTO region are candidates
 - diagonal-only colors are ignored
-- colors elsewhere in the logo cannot enter the AUTO region
-- AUTO propagates geodesically from the real contact edges
-- an isolated AUTO region is left unresolved instead of being guessed
+- non-touching colors elsewhere in the logo cannot enter the AUTO region
+- propagation stays inside the same connected AUTO region
+- isolated AUTO is reported instead of being guessed
 
-`Calculate` remains the point at which AUTO is resolved and Manual changes are committed.
+The new raster cleanup also runs **before AUTO**, so a tiny stray Blue/Black/Red pixel cannot incorrectly become an AUTO seed if it can first be identified as a local artifact.
 
 ## Min. Island Area
 
-`Min. Island Area (mm²)` controls the physical threshold for tiny color islands.
+`Min. Island Area (mm²)` now affects both:
 
-For example, with the default-style value around `0.08 mm²`, embedded single-pixel / micro-artifact regions are usually transferred to their strongest surrounding stable color.
+- **Calculate / Manual raster cleanup**
+- final STL geometry cleanup
 
-Set the value lower if a logo intentionally contains extremely small embedded details.
+The physical threshold is converted into source-image pixels using the requested final Logo Width / Height.
 
-A small detail that is isolated in true background is preserved because it has no neighboring print color to absorb it.
+If your logo intentionally contains extremely small embedded details, reduce `Min. Island Area`.
 
 ## Exact STL Dimensions
 
@@ -103,20 +112,11 @@ With **Lock aspect ratio** enabled:
 
 - Width updates Height
 - Height updates Width
-- the logo remains proportional
+- scaling remains proportional
 
 With the lock disabled, Width and Height are independent.
 
-Transparent source-image margins do not reduce the requested final STL dimensions.
-
-## Manual Workflow
-
-Manual changes remain draft-only while editing.
-
-- Brush / Line / Fill update the Manual view
-- other previews and STL export continue using the last calculated state
-- `Calculate` commits Manual changes
-- AUTO is resolved on Calculate
+Transparent source-image margins do not reduce the requested final dimensions.
 
 ## Compact Display Support
 
@@ -128,18 +128,6 @@ Manual changes remain draft-only while editing.
 - scrollable detected-color list
 - mouse-wheel scrolling in STL Preview
 
-### Open by default
-
-- File & Export
-- Logo & Analysis
-- Color Analysis
-
-### Collapsed by default
-
-- Profile
-- Target Surface & Fit
-- Geometry Quality
-
 ## Typical Workflow
 
 1. Load a logo
@@ -148,9 +136,10 @@ Manual changes remain draft-only while editing.
 4. Use AUTO where useful
 5. Correct pixels in **Manual**
 6. Click **Calculate**
-7. Review **STL Preview**
-8. Review **Final Preview**
-9. Click **(Finish) Generate STLs**
+7. Check the cleaned Manual result
+8. Review **STL Preview**
+9. Review **Final Preview**
+10. Click **(Finish) Generate STLs**
 
 ## Build the Windows EXE
 
@@ -160,23 +149,23 @@ Install dependencies:
 python -m pip install -r requirements.txt
 ```
 
-Then run:
+Run:
 
 ```text
 build_exe.bat
 ```
 
-The Windows build target is:
+Output:
 
 ```text
-dist/Logo to STL Tool 8.1.exe
+dist/Logo to STL Tool 8.2.exe
 ```
 
 ## Testing
 
 See:
 
-[TEST_REPORT_V8_1.md](TEST_REPORT_V8_1.md)
+[TEST_REPORT_V8_2.md](TEST_REPORT_V8_2.md)
 
 ## Development
 

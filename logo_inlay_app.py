@@ -13,7 +13,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
 from PIL import Image, ImageTk
 import numpy as np
 
-from logo_inlay_core import analyze_colors, generate_logo_stls, build_partition_preview, redistribute_auto_groups
+from logo_inlay_core import analyze_colors, generate_logo_stls, build_partition_preview, redistribute_auto_groups, cleanup_small_color_islands
 
 try:
     from logo_inlay_core import guess_color_name
@@ -21,7 +21,7 @@ except ImportError:
     from logo_inlay_core import closest_color_name as guess_color_name
 
 
-APP_TITLE = "Logo to STL Tool 8.1"
+APP_TITLE = "Logo to STL Tool 8.2"
 MANUAL_AUTO_LABEL = -2147483000
 APP_DIR = Path.home() / ".logo_inlay_tool"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -191,7 +191,7 @@ TIP = {
     "background": "Defines what is treated as background. Transparent uses the alpha channel. White removes bright white. Corner color uses the image corners. Outer connected color removes only the matching color connected to the image edge.",
     "contour": "Controls how vector edges are generated. Straight / crisp is usually best for logos and lettering. Smooth curves favors rounded shapes. Maximum detail keeps more small features but can produce noisier contours.",
     "smooth": "Simplifies the final vector contour. Higher values reduce tiny edge variations but may remove fine details.",
-    "min_area": "Minimum area for tiny embedded color islands. Smaller specks are reassigned to the strongest surrounding print color instead of becoming separate STL islands. Truly isolated details with no neighboring print color are preserved.",
+    "min_area": "Minimum physical area for tiny embedded color islands. V8.2 applies this already when Calculate is pressed and again during STL geometry generation. Smaller specks are reassigned only to the strongest directly adjacent print color; diagonal/non-touching colors are ignored. Truly isolated details with no neighboring print color are preserved.",
     "deck": "Dimensions of the target surface in millimeters. Used for the final placement preview only.",
 }
 
@@ -2211,8 +2211,39 @@ class App(tk.Tk):
                     "name": "auto verteilen",
                 }]
 
-            # Resolve AUTO only once, at calculation time.
-            resolved, _ = redistribute_auto_groups(draft, plan)
+            # V8.2: remove tiny already-assigned color specks BEFORE AUTO.
+            # This is the missing raster-level cleanup: the result is visible
+            # directly in Manual after Calculate, not only later in STL Preview.
+            min_area_mm2 = self._safe_var_float(self.min_area, 0.08)
+            target_width_mm = self._safe_var_float(self.target_w, 70.0)
+            target_height_mm = self._safe_var_float(self.target_h, 45.0)
+            keep_aspect = bool(self.keep_aspect.get())
+
+            pre_cleaned, pre_stats = cleanup_small_color_islands(
+                label_img=draft,
+                color_plan=plan,
+                min_area_mm2=min_area_mm2,
+                target_width_mm=target_width_mm,
+                target_height_mm=target_height_mm,
+                keep_aspect=keep_aspect,
+                background_mask=self.manual_background_mask,
+            )
+
+            # Resolve AUTO only once, at calculation time, after obvious tiny
+            # wrong-color islands have been removed as possible AUTO seeds.
+            resolved, _ = redistribute_auto_groups(pre_cleaned, plan)
+
+            # Clean once more after AUTO so the committed Manual raster itself
+            # is spatially clean before any STL/vector processing starts.
+            resolved, post_stats = cleanup_small_color_islands(
+                label_img=resolved,
+                color_plan=plan,
+                min_area_mm2=min_area_mm2,
+                target_width_mm=target_width_mm,
+                target_height_mm=target_height_mm,
+                keep_aspect=keep_aspect,
+                background_mask=self.manual_background_mask,
+            )
 
             auto_ids = {
                 int(item["cluster"])
@@ -2256,10 +2287,27 @@ class App(tk.Tk):
             self.update_group_preview()
             self.update_deck_preview()
 
-            self.status.set(
-                "Calculation complete. Manual edits and AUTO assignments were applied "
-                "to all previews."
+            cleaned_pixels = int(
+                pre_stats.get("changed_pixels", 0)
+                + post_stats.get("changed_pixels", 0)
             )
+            cleaned_components = int(
+                pre_stats.get("changed_components", 0)
+                + post_stats.get("changed_components", 0)
+            )
+
+            if cleaned_pixels > 0:
+                self.status.set(
+                    "Calculation complete. AUTO was resolved and "
+                    f"{cleaned_pixels} stray pixel(s) in approximately "
+                    f"{cleaned_components} tiny region(s) were reassigned to "
+                    "their strongest directly adjacent print color."
+                )
+            else:
+                self.status.set(
+                    "Calculation complete. Manual edits and AUTO assignments were "
+                    "applied to all previews."
+                )
 
             try:
                 if self.notebook.tab(self.notebook.select(), "text") == "STL Preview":
