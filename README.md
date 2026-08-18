@@ -2,184 +2,110 @@
 
 A Windows desktop application for converting raster logos into separate STL files for multi-color 3D printing.
 
-The tool detects colors, lets you group and manually correct them, previews the final vector geometry, and exports one STL per print color together with matching cutout and clearance geometry.
-
 ## Current Version
 
-**V8 Final / v8.0**
+**V8 Final / v8.0 — corrected final build**
 
 ## Main Features
 
-- PNG, JPG, JPEG, WEBP and BMP input
 - Automatic color detection and grouping
-- Manual assignment of detected shades to print-color groups
-- `AUTO` for anti-aliased / transitional pixels
-- `BG` for true background regions
-- Manual editor with Brush, Line, Fill Area and Eyedropper
-- Undo, Reset, zoom and pan
-- Real-time responsive brush painting
-- Adjustable geometry resolution and edge smoothing
-- Straight, smooth and maximum-detail contour modes
-- STL geometry preview and integrity check
-- Mouse-wheel scrolling in settings, detected colors and STL Preview
-- Separate STL export for every print color
-- Complete cutout STL
-- Negative / clearance STL
-- Automatic project-specific output folder
-- Compact-display friendly layout
+- Manual Brush, Line, Fill Area and Eyedropper
+- AUTO assignment for anti-aliased / transition pixels
+- BG handling for true background regions
+- Real-time responsive Manual brush
+- Exact final STL Width / Height controls
+- Adjustable contour mode, geometry resolution and smoothing
+- Local color-aware STL partitioning
+- STL geometry and integrity preview
+- Final Preview on a configurable target surface
+- Separate STL files for each print color
+- Complete cutout and clearance STL
+- Mouse-wheel scrolling throughout compact-display workflows
 
-## V8 Final — Exact STL Dimensions
+## Final STL Dimensions
 
-`Logo Width (mm)` and `Logo Height (mm)` now describe the **final STL footprint**, not the complete raster-image canvas.
+`Logo Width (mm)` and `Logo Height (mm)` control the final STL footprint.
 
-Transparent or removed margins around a source image therefore no longer make the exported logo smaller than the requested value.
+With **Lock aspect ratio** enabled:
 
-### Lock aspect ratio enabled
+- Width updates Height automatically
+- Height updates Width automatically
+- proportional scaling is preserved
+- the final vector geometry uses the requested Width exactly
 
-- Entering a new **Width** automatically updates **Height**
-- Entering a new **Height** automatically updates **Width**
-- Scaling remains proportional
-- Width is applied exactly to the final vector/STL geometry
-- After final vectorization, Height is synchronized to the actual proportional final height
+With the lock disabled, Width and Height are independent and both are applied exactly.
 
-### Lock aspect ratio disabled
+## Corrected V8 Final — Final Preview
 
-Width and Height are independent and both are applied exactly to the final STL geometry.
+The Final Preview has been hardened:
 
-The STL Preview shows the calculated physical footprint directly, for example:
+- it refreshes immediately after a successful color analysis
+- it refreshes after Manual → Calculate
+- it no longer leaves a stale `Analyze colors first.` message when analysis exists
+- German decimal-comma input such as `68,7` and `97,5` is accepted
+- logos larger than the target surface can still be displayed safely
+- true background / BG holes remain transparent so the target-surface color shows through
+- invalid values now produce a meaningful preview message instead of silently returning
 
-```text
-Final Geometry — 80.00 × 39.90 mm
-```
+## Corrected V8 Final — Tiny Wrong-Color Islands
 
-## V8 Final — Stability Improvements
+Two geometry safeguards are now combined.
 
-The complete workflow was reviewed for the V8 release.
+### 1. Stronger local gap assignment
 
-Notable changes:
+Microscopic vectorization gaps primarily follow the color with the strongest shared local boundary.
 
-- Width / Height edits invalidate STL geometry correctly
-- Preview and export use the same shared geometry-preparation path
-- Analysis settings are remembered from the analysis that produced the current label map
-- Changing analysis controls does not silently reinterpret an older analysis; changes take effect after **Analyze Colors**
-- Selecting a new image clears old analysis, Manual and STL state
-- Background workers no longer read Tkinter variables directly
-- Worker results are passed back through a main-thread UI queue
-- Duplicate/conflicting analysis, preview and export jobs are guarded
-- Physical and analysis inputs receive additional validation
-- Profiles apply Width / Height atomically so aspect-lock traces cannot overwrite profile values
-- Local output folders are no longer stored inside reusable profiles
+A weak raster vote can no longer override a much stronger neighboring color and create a tiny wrong-color speck.
 
-For backward compatibility, the existing settings directory is intentionally retained:
+### 2. Min. Island Area now cleans embedded color specks
 
-```text
-~/.logo_inlay_tool/
-```
+`Min. Island Area (mm²)` now also applies to tiny color components inside the logo.
 
-This preserves existing profiles and settings after the application rename.
+A sub-threshold embedded island is transferred to the strongest stable neighboring print color. Its exact geometry is transferred rather than deleted, so:
 
-## Manual Editing
+- no STL gap is created
+- no overlap is created
+- the overall cutout silhouette remains unchanged
 
-Brush painting is displayed immediately while dragging without rebuilding and rescaling the complete Manual bitmap for every mouse event.
+A truly isolated small detail with no neighboring print color is preserved.
 
-The editable label map is updated through small local regions, while a lightweight Canvas stroke provides immediate visual feedback.
+## Manual Workflow
 
-`Calculate` behavior remains deliberate:
+Manual edits remain draft-only until **Calculate** is pressed.
 
-- Manual edits stay local/draft-only while editing
-- Other previews and STL export continue to use the last calculated state
-- `Calculate` commits Manual changes
-- AUTO regions are resolved when `Calculate` is pressed
+While editing:
 
-## Local Color-Aware STL Partitioning
+- the Manual preview updates immediately
+- the committed STL state remains unchanged
 
-Microscopic vectorization gaps are assigned to the most plausible locally adjacent color instead of being given to the globally largest color.
+When Calculate is pressed:
 
-This reduces thin wrong-color artifacts around lettering while preserving:
-
-- gap-free color partitioning
-- non-overlapping color regions
-- shared STL boundaries
+- Manual changes are committed
+- AUTO regions are resolved
+- STL Preview and Final Preview use the calculated state
 
 ## Compact Display Support
 
-The Edit tab includes:
-
-- collapsible **Quick Workflow**
-- visible **DRAG TO RESIZE PREVIEW / COLORS** grip
-- draggable divider between preview and detected colors
-- automatically resizing logo preview
+- collapsible Quick Workflow
+- draggable Preview / Colors divider
+- visible resize grip
+- scrollable left settings
 - scrollable detected-color list
-- mouse-wheel scrolling
-
-The complete left settings column is also vertically scrollable.
-
-### Open by default
-
-- File & Export
-- Logo & Analysis
-- Color Analysis
-
-### Collapsed by default
-
-- Profile
-- Target Surface & Fit
-- Geometry Quality
+- mouse-wheel scrolling in STL Preview
+- responsive logo preview
 
 ## Typical Workflow
 
 1. Load a logo
 2. Click **(Start) Analyze Colors**
-3. Assign detected colors to print groups
-4. Use `AUTO` for transition / anti-aliasing shades when useful
-5. Open **Manual** and make corrections
-6. Click **Calculate**
-7. Review **STL Preview**
+3. Assign detected colors
+4. Fine-tune in **Manual**
+5. Click **Calculate**
+6. Review **STL Preview**
+7. Review **Final Preview** if desired
 8. Click **(Finish) Generate STLs**
 
-## Output Example
-
-For a project named `Monopoly`:
-
-```text
-Monopoly_STL/
-├── monopoly_color_01_black.stl
-├── monopoly_color_02_white.stl
-├── monopoly_complete_cutout.stl
-├── monopoly_negative_clearance_0_00mm.stl
-├── monopoly_preview.png
-└── monopoly_info.json
-```
-
-The exporter performs topology checks. If a remaining mesh issue is detected, the STL is still written and the application reports that slicer repair may be required.
-
-## Run from Source
-
-### Requirements
-
-- Windows 10 or Windows 11
-- Python 3
-- packages listed in `requirements.txt`
-
-Install dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-Run:
-
-```bash
-python logo_inlay_app.py
-```
-
-or:
-
-```text
-start_app.bat
-```
-
-## Build the Standalone Windows EXE
+## Build the Windows EXE
 
 Run:
 
@@ -187,30 +113,20 @@ Run:
 build_exe.bat
 ```
 
-PyInstaller creates:
+Output:
 
 ```text
 dist/Logo to STL Tool 8.0.exe
 ```
 
-The compiled executable can then be copied to another Windows PC without requiring a separate Python installation.
-
 ## Testing
 
-V8 Final received a broad automated regression pass covering the main Core and GUI workflows.
-
 See [TEST_REPORT_V8_FINAL.md](TEST_REPORT_V8_FINAL.md).
-
-The automated suite measured approximately **74% statement coverage** across the application and core modules. Coverage is useful as a regression metric, but it is not a guarantee that software can never contain a bug.
 
 ## Development
 
 Created by **Florian Hesse** with development assistance from **ChatGPT by OpenAI**.
 
-ChatGPT was used for code generation, debugging, UI refinement, geometry logic, regression testing and workflow development.
-
 ## License
 
-Licensed under the **MIT License**.
-
-See [LICENSE](LICENSE) for details.
+MIT License. See [LICENSE](LICENSE).

@@ -191,7 +191,7 @@ TIP = {
     "background": "Defines what is treated as background. Transparent uses the alpha channel. White removes bright white. Corner color uses the image corners. Outer connected color removes only the matching color connected to the image edge.",
     "contour": "Controls how vector edges are generated. Straight / crisp is usually best for logos and lettering. Smooth curves favors rounded shapes. Maximum detail keeps more small features but can produce noisier contours.",
     "smooth": "Simplifies the final vector contour. Higher values reduce tiny edge variations but may remove fine details.",
-    "min_area": "Removes very small isolated regions. Increasing this value reduces tiny artifacts and can simplify the final mesh.",
+    "min_area": "Minimum area for tiny embedded color islands. Smaller specks are reassigned to the strongest surrounding print color instead of becoming separate STL islands. Truly isolated details with no neighboring print color are preserved.",
     "deck": "Dimensions of the target surface in millimeters. Used for the final placement preview only.",
 }
 
@@ -527,11 +527,53 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-    def _safe_var_float(self, variable, default=None):
+    def _raw_var_value(self, variable):
+        """Return a Tk variable value even while its typed text is temporarily invalid.
+
+        On German Windows systems users naturally enter decimal commas. Tk
+        DoubleVar.get() may raise while the Entry contains e.g. "68,7", so we
+        fall back to the underlying Tcl variable text and normalize the comma.
+        """
         try:
-            value = float(variable.get())
+            return variable.get()
+        except Exception:
+            pass
+        try:
+            return self.tk.globalgetvar(variable._name)
+        except Exception:
+            return None
+
+    def _safe_var_float(self, variable, default=None):
+        raw = self._raw_var_value(variable)
+        if raw is None:
+            return default
+        try:
+            if isinstance(raw, str):
+                text = raw.strip().replace(" ", "")
+                # Accept the common German decimal-comma form. If both
+                # separators are present, treat "." as thousands separator and
+                # "," as decimal separator only for the typical DE ordering.
+                if "," in text:
+                    if "." in text and text.rfind(",") > text.rfind("."):
+                        text = text.replace(".", "").replace(",", ".")
+                    else:
+                        text = text.replace(",", ".")
+                raw = text
+            value = float(raw)
             if np.isfinite(value):
                 return value
+        except Exception:
+            pass
+        return default
+
+    def _safe_var_int(self, variable, default=None):
+        value = self._safe_var_float(variable, None)
+        if value is None:
+            return default
+        try:
+            rounded = int(round(value))
+            if abs(value - rounded) < 1e-9:
+                return rounded
         except Exception:
             pass
         return default
@@ -845,31 +887,40 @@ class App(tk.Tk):
         return {}
 
     def current_settings(self):
+        """Return serializable settings without failing on in-progress Entry text."""
+        def f(var, fallback):
+            value = self._safe_var_float(var, None)
+            return fallback if value is None else value
+
+        def i(var, fallback):
+            value = self._safe_var_int(var, None)
+            return fallback if value is None else value
+
         return {
             "image_path": self.image_path.get(),
             "project": self.project.get(),
             "out_dir": self.out_dir.get(),
             "output_base_dir": str(self.output_base_dir) if self.output_base_dir else "",
             "profile_name": self.profile_name.get(),
-            "target_w": self.target_w.get(),
-            "target_h": self.target_h.get(),
-            "keep_aspect": self.keep_aspect.get(),
-            "detect_colors": self.detect_colors.get(),
-            "height": self.height.get(),
-            "cut": self.cut.get(),
-            "clearance": self.clearance.get(),
+            "target_w": f(self.target_w, 70.0),
+            "target_h": f(self.target_h, 45.0),
+            "keep_aspect": bool(self.keep_aspect.get()),
+            "detect_colors": i(self.detect_colors, 4),
+            "height": f(self.height, 0.8),
+            "cut": f(self.cut, 0.8),
+            "clearance": f(self.clearance, 0.0),
             "background": self.background.get(),
             "contour_mode": self.contour_mode.get(),
-            "white_threshold": self.white_threshold.get(),
-            "working_pixels": self.working_pixels.get(),
-            "smooth": self.smooth.get(),
+            "white_threshold": i(self.white_threshold, 245),
+            "working_pixels": i(self.working_pixels, 1600),
+            "smooth": f(self.smooth, 0.06),
             "edge_smoothing": self.edge_smoothing.get(),
-            "geometry_pixels": self.geometry_pixels.get(),
-            "min_area": self.min_area.get(),
-            "auto_merge": self.auto_merge.get(),
-            "merge_distance": self.merge_distance.get(),
-            "deckel_w": self.deckel_w.get(),
-            "deckel_h": self.deckel_h.get(),
+            "geometry_pixels": i(self.geometry_pixels, 1600),
+            "min_area": f(self.min_area, 0.08),
+            "auto_merge": bool(self.auto_merge.get()),
+            "merge_distance": f(self.merge_distance, 18.0),
+            "deckel_w": f(self.deckel_w, 110.0),
+            "deckel_h": f(self.deckel_h, 80.0),
             "deck_color": self.deck_color.get(),
             "manual_bg_color": self.manual_bg_color.get(),
         }
@@ -1383,7 +1434,7 @@ class App(tk.Tk):
         self.mark_preview_dirty()
         self.status.set(
             f"Recalculating geometry: {self.edge_smoothing.get()} "
-            f"({self.edge_smoothing_mm():.2f} mm), {int(self.geometry_pixels.get())} px. "
+            f"({self.edge_smoothing_mm():.2f} mm), {self._safe_var_int(self.geometry_pixels, 0)} px. "
             "Color assignments are preserved."
         )
         self.save_settings()
@@ -1604,12 +1655,12 @@ class App(tk.Tk):
         try:
             params = {
                 "image_path": Path(image_path),
-                "working_pixels": int(self.working_pixels.get()),
-                "detect_colors": int(self.detect_colors.get()),
+                "working_pixels": self._safe_var_int(self.working_pixels),
+                "detect_colors": self._safe_var_int(self.detect_colors),
                 "background_mode": self.background.get(),
-                "white_threshold": int(self.white_threshold.get()),
+                "white_threshold": self._safe_var_int(self.white_threshold),
                 "auto_merge": bool(self.auto_merge.get()),
-                "merge_distance": float(self.merge_distance.get()),
+                "merge_distance": self._safe_var_float(self.merge_distance),
                 "out_dir": Path(self.out_dir.get())
                 if self.out_dir.get().strip() else None,
             }
@@ -1696,6 +1747,10 @@ class App(tk.Tk):
         }
         self._analysis_auto_merge_used = bool(params["auto_merge"])
         self.render_colors()
+        # The Final Preview may still contain the placeholder written when a
+        # new image was selected. Refresh it immediately after analysis so it
+        # never stays stuck on "Analyze colors first.".
+        self.update_deck_preview()
 
     def _finish_analysis_error(self, error_text):
         self.analysis_busy = False
@@ -2714,12 +2769,12 @@ class App(tk.Tk):
         if used:
             return dict(used)
         return {
-            "working_pixels": int(self.working_pixels.get()),
-            "detect_colors": int(self.detect_colors.get()),
+            "working_pixels": self._safe_var_int(self.working_pixels),
+            "detect_colors": self._safe_var_int(self.detect_colors),
             "background_mode": self.background.get(),
-            "white_threshold": int(self.white_threshold.get()),
+            "white_threshold": self._safe_var_int(self.white_threshold),
             "auto_merge": bool(self.auto_merge.get()),
-            "merge_distance": float(self.merge_distance.get()),
+            "merge_distance": self._safe_var_float(self.merge_distance),
         }
 
     def start_final_preview(self, force=False):
@@ -2765,16 +2820,16 @@ class App(tk.Tk):
             params = {
                 "image_path": Path(self.image_path.get()),
                 "color_plan": color_plan,
-                "manual_width_mm": float(self.target_w.get()),
-                "manual_height_mm": float(self.target_h.get()),
+                "manual_width_mm": self._safe_var_float(self.target_w),
+                "manual_height_mm": self._safe_var_float(self.target_h),
                 "keep_aspect": bool(self.keep_aspect.get()),
                 "detect_colors": int(analysis_used["detect_colors"]),
                 "background_mode": analysis_used["background_mode"],
                 "white_threshold": int(analysis_used["white_threshold"]),
                 "working_pixels": int(analysis_used["working_pixels"]),
-                "geometry_pixels": int(self.geometry_pixels.get()),
-                "min_area_mm2": float(self.min_area.get()),
-                "simplify_mm": float(self.smooth.get()),
+                "geometry_pixels": self._safe_var_int(self.geometry_pixels),
+                "min_area_mm2": self._safe_var_float(self.min_area),
+                "simplify_mm": self._safe_var_float(self.smooth),
                 "close_strength": 0,
                 "auto_merge": bool(analysis_used["auto_merge"]),
                 "merge_distance": float(analysis_used["merge_distance"]),
@@ -2801,8 +2856,8 @@ class App(tk.Tk):
                 "_ui_geometry_settings": {
                     "smoothing_name": self.edge_smoothing.get(),
                     "smoothing_mm": self.edge_smoothing_mm(),
-                    "geometry_pixels": int(self.geometry_pixels.get()),
-                    "simplify_mm": float(self.smooth.get()),
+                    "geometry_pixels": self._safe_var_int(self.geometry_pixels),
+                    "simplify_mm": self._safe_var_float(self.smooth),
                     "contour_mode": self.contour_display.get(),
                 },
             }
@@ -3048,70 +3103,126 @@ class App(tk.Tk):
         return arr
 
     def update_deck_preview(self):
+        """Render the current calculated logo on the target surface.
+
+        This preview is deliberately independent of STL vector calculation, but
+        it uses the committed Manual state. It is also tolerant of decimal-comma
+        input and logos that are larger than the target surface.
+        """
+        if not hasattr(self, "deck_preview"):
+            return
+
         if not self.analysis:
+            self.deck_preview.configure(image="", text="Analyze colors first.")
+            self.deckel_photo = None
             return
 
         label_img = self.get_effective_label_img()
         if label_img is None:
+            self.deck_preview.configure(image="", text="No calculated logo data available.")
+            self.deckel_photo = None
             return
 
         target_w = self._safe_var_float(self.target_w)
         target_h = self._safe_var_float(self.target_h)
         deck_w = self._safe_var_float(self.deckel_w)
         deck_h = self._safe_var_float(self.deckel_h)
+
         if (
             target_w is None or target_h is None
             or deck_w is None or deck_h is None
             or target_w <= 0 or target_h <= 0
             or deck_w <= 0 or deck_h <= 0
         ):
+            self.deck_preview.configure(
+                image="",
+                text=(
+                    "Enter valid positive dimensions for Logo Width / Height "
+                    "and Target Surface Width / Height."
+                ),
+            )
+            self.deckel_photo = None
             return
 
-        deck_rgb = self.parse_hex_color(self.deck_color.get())
-        logo = self.logo_array_on_background(label_img, deck_rgb)
+        try:
+            deck_rgb = self.parse_hex_color(self.deck_color.get())
+            logo_rgb = self.logo_array_on_background(label_img, deck_rgb)
 
-        # Crop away non-printing source-image margins. Logo Width / Height refer
-        # to the final STL footprint, not to the original raster canvas.
-        active = self._current_printable_mask(label_img)
-        if active is None or not np.any(active):
-            return
-        ys, xs = np.nonzero(active)
-        x0c, x1c = int(xs.min()), int(xs.max()) + 1
-        y0c, y1c = int(ys.min()), int(ys.max()) + 1
-        logo = logo[y0c:y1c, x0c:x1c]
+            active = self._current_printable_mask(label_img)
+            if active is None or not np.any(active):
+                self.deck_preview.configure(
+                    image="",
+                    text="No printable color area is available for the Final Preview.",
+                )
+                self.deckel_photo = None
+                return
 
-        canvas_w, canvas_h = 760, 480
-        scale = min(
-            (canvas_w - 80) / max(1.0, deck_w),
-            (canvas_h - 80) / max(1.0, deck_h),
-        )
-        dw, dh = int(deck_w * scale), int(deck_h * scale)
+            # Crop away source-image padding while preserving true transparent /
+            # BG holes through a separate alpha mask.
+            ys, xs = np.nonzero(active)
+            x0c, x1c = int(xs.min()), int(xs.max()) + 1
+            y0c, y1c = int(ys.min()), int(ys.max()) + 1
+            logo_rgb = logo_rgb[y0c:y1c, x0c:x1c]
+            logo_alpha = (active[y0c:y1c, x0c:x1c].astype(np.uint8) * 255)
 
-        bg = np.ones((canvas_h, canvas_w, 3), dtype=np.uint8) * 238
-        x0, y0 = (canvas_w - dw) // 2, (canvas_h - dh) // 2
-        bg[y0:y0 + dh, x0:x0 + dw] = np.array(deck_rgb, dtype=np.uint8)
-        bg[y0:y0 + 2, x0:x0 + dw] = 80
-        bg[y0 + dh - 2:y0 + dh, x0:x0 + dw] = 80
-        bg[y0:y0 + dh, x0:x0 + 2] = 80
-        bg[y0:y0 + dh, x0 + dw - 2:x0 + dw] = 80
+            canvas_w, canvas_h = 760, 480
 
-        lw = max(1, int(round(target_w * scale)))
-        lh = max(1, int(round(target_h * scale)))
+            # Fit both the target surface AND a potentially oversized logo into
+            # the preview canvas. This avoids negative/out-of-bounds composite
+            # coordinates while still making oversize immediately visible.
+            span_w = max(deck_w, target_w)
+            span_h = max(deck_h, target_h)
+            scale = min(
+                (canvas_w - 80) / max(1.0, span_w),
+                (canvas_h - 80) / max(1.0, span_h),
+            )
+            scale = max(scale, 0.01)
 
-        # The two fields are the final physical dimensions. With aspect lock on
-        # target_h is synchronized automatically; with it off both dimensions
-        # intentionally scale independently.
-        logo_img = Image.fromarray(logo).convert("RGBA").resize(
-            (lw, lh), Image.Resampling.LANCZOS
-        )
+            dw = max(1, int(round(deck_w * scale)))
+            dh = max(1, int(round(deck_h * scale)))
+            lw = max(1, int(round(target_w * scale)))
+            lh = max(1, int(round(target_h * scale)))
 
-        bg_img = Image.fromarray(bg).convert("RGBA")
-        lx = x0 + (dw - logo_img.size[0]) // 2
-        ly = y0 + (dh - logo_img.size[1]) // 2
-        bg_img.alpha_composite(logo_img, (lx, ly))
+            bg = np.ones((canvas_h, canvas_w, 3), dtype=np.uint8) * 238
+            deck_x = (canvas_w - dw) // 2
+            deck_y = (canvas_h - dh) // 2
+            bg[
+                deck_y:deck_y + dh,
+                deck_x:deck_x + dw,
+            ] = np.asarray(deck_rgb, dtype=np.uint8)
 
-        self.deckel_photo = ImageTk.PhotoImage(bg_img)
-        self.deck_preview.configure(image=self.deckel_photo, text="")
+            # Clear border around the target surface.
+            if dh >= 2 and dw >= 2:
+                bg[deck_y:deck_y + 2, deck_x:deck_x + dw] = 80
+                bg[deck_y + dh - 2:deck_y + dh, deck_x:deck_x + dw] = 80
+                bg[deck_y:deck_y + dh, deck_x:deck_x + 2] = 80
+                bg[deck_y:deck_y + dh, deck_x + dw - 2:deck_x + dw] = 80
+
+            logo_img = Image.fromarray(logo_rgb).convert("RGBA").resize(
+                (lw, lh), Image.Resampling.LANCZOS
+            )
+            alpha_img = Image.fromarray(logo_alpha, mode="L").resize(
+                (lw, lh), Image.Resampling.NEAREST
+            )
+            logo_img.putalpha(alpha_img)
+
+            bg_img = Image.fromarray(bg).convert("RGBA")
+            logo_x = (canvas_w - lw) // 2
+            logo_y = (canvas_h - lh) // 2
+            bg_img.alpha_composite(logo_img, (logo_x, logo_y))
+
+            self.deckel_photo = ImageTk.PhotoImage(bg_img)
+            self.deck_preview.configure(image=self.deckel_photo, text="")
+
+        except Exception as exc:
+            # Never leave a misleading stale "Analyze colors first." placeholder
+            # when analysis actually exists.
+            self.deckel_photo = None
+            self.deck_preview.configure(
+                image="",
+                text=f"Final Preview error: {exc}",
+            )
+
 
     def start_generate(self):
         if self.generate_busy:
@@ -3180,23 +3291,23 @@ class App(tk.Tk):
                 "project_name": self.project.get(),
                 "color_plan": self.get_color_plan(),
                 "target_mode": "manual",
-                "manual_width_mm": float(self.target_w.get()),
-                "manual_height_mm": float(self.target_h.get()),
+                "manual_width_mm": self._safe_var_float(self.target_w),
+                "manual_height_mm": self._safe_var_float(self.target_h),
                 "keep_aspect": bool(self.keep_aspect.get()),
-                "deck_width_mm": float(self.deckel_w.get()),
-                "deck_height_mm": float(self.deckel_h.get()),
+                "deck_width_mm": self._safe_var_float(self.deckel_w),
+                "deck_height_mm": self._safe_var_float(self.deckel_h),
                 "margin_mm": 0.0,
                 "fit_percent": 100.0,
-                "height_mm": float(self.height.get()),
-                "cut_depth_mm": float(self.cut.get()),
-                "clearance_mm": float(self.clearance.get()),
+                "height_mm": self._safe_var_float(self.height),
+                "cut_depth_mm": self._safe_var_float(self.cut),
+                "clearance_mm": self._safe_var_float(self.clearance),
                 "detect_colors": int(analysis_used["detect_colors"]),
                 "background_mode": analysis_used["background_mode"],
                 "white_threshold": int(analysis_used["white_threshold"]),
                 "working_pixels": int(analysis_used["working_pixels"]),
-                "geometry_pixels": int(self.geometry_pixels.get()),
-                "min_area_mm2": float(self.min_area.get()),
-                "simplify_mm": float(self.smooth.get()),
+                "geometry_pixels": self._safe_var_int(self.geometry_pixels),
+                "min_area_mm2": self._safe_var_float(self.min_area),
+                "simplify_mm": self._safe_var_float(self.smooth),
                 "close_strength": 0,
                 "auto_merge": bool(analysis_used["auto_merge"]),
                 "merge_distance": float(analysis_used["merge_distance"]),

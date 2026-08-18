@@ -501,19 +501,16 @@ def _choose_local_gap_owner(
     raw: dict,
     simplify_mm: float,
 ):
-    """Choose the most plausible local color owner for one leftover polygon.
+    """Choose the most plausible local color owner for a vectorization gap.
 
-    The most important rule is continuity: whenever possible, a gap is assigned
-    to a color it actually touches so it merges into that existing part instead
-    of becoming a new floating island. The raster vote then resolves which of
-    the touching colors is locally correct.
+    Continuity is the primary signal. A raster vote may break a near tie, but a
+    weak one-pixel vote is no longer allowed to override a much stronger shared
+    boundary with another color. That was the source of occasional green/red
+    micro-specks along otherwise black/white edges.
     """
     gid = _gap_pixel_vote(gap, group_map, mm_per_px)
     voted = names[gid] if gid is not None and 0 <= gid < len(names) else None
 
-    # First identify colors that genuinely share boundary/contact with this gap.
-    # Because the gap was produced by subtracting the vector pieces from total,
-    # exact boundary contact is normally available.
     exact_contacts = []
     for name in names:
         geom = partition.get(name)
@@ -527,14 +524,22 @@ def _choose_local_gap_owner(
             exact_contacts.append((shared, name))
 
     if exact_contacts:
-        touching_names = {name for _, name in exact_contacts}
-        if voted in touching_names:
-            return voted
         exact_contacts.sort(reverse=True)
-        return exact_contacts[0][1]
+        best_score, best_name = exact_contacts[0]
 
-    # Numerical contour simplification can leave a microscopic separation.
-    # Use a very narrow local band as a second continuity test.
+        # Let the raster vote decide only when it is genuinely competitive with
+        # the strongest geometric neighbor.
+        if voted is not None:
+            voted_score = next(
+                (score for score, name in exact_contacts if name == voted),
+                0.0,
+            )
+            if voted_score >= best_score * 0.80:
+                return voted
+        return best_name
+
+    # Numerical simplification can leave a microscopic separation. Measure a
+    # narrow contact band and again prefer its strongest local neighbor.
     tol = max(float(mm_per_px) * 0.55, float(simplify_mm) * 0.12, 1e-6)
     band = gap.buffer(tol)
     near_contacts = []
@@ -550,15 +555,19 @@ def _choose_local_gap_owner(
             near_contacts.append((score, name))
 
     if near_contacts:
-        touching_names = {name for _, name in near_contacts}
-        if voted in touching_names:
-            return voted
         near_contacts.sort(reverse=True)
-        return near_contacts[0][1]
+        best_score, best_name = near_contacts[0]
+        if voted is not None:
+            voted_score = next(
+                (score for score, name in near_contacts if name == voted),
+                0.0,
+            )
+            if voted_score >= best_score * 0.80:
+                return voted
+        return best_name
 
-    # If there is no geometric contact at all, fall back to the smoothed raster
-    # ownership map, which is still local and far better than a global largest
-    # color fallback.
+    # Only when geometry offers no local neighbor at all do we fall back to the
+    # smoothed raster ownership map.
     if voted is not None:
         geom = raw.get(voted)
         if geom is not None and not geom.is_empty:
@@ -589,6 +598,140 @@ def _choose_local_gap_owner(
     if candidates:
         return max(candidates)[1]
     return None
+
+
+def _choose_small_island_neighbor(
+    island: Polygon,
+    original_name: str,
+    names: list[str],
+    stable_partition: dict,
+    mm_per_px: float,
+    simplify_mm: float,
+):
+    """Choose a surrounding stable color for a tiny embedded color island.
+
+    Returning None means the island has no meaningful neighboring printable
+    color (for example an intentionally isolated dot in a separate silhouette);
+    such an island is preserved in its original group.
+    """
+    contacts = []
+    for name in names:
+        if name == original_name:
+            continue
+        geom = stable_partition.get(name)
+        if geom is None or geom.is_empty:
+            continue
+        try:
+            shared = float(island.boundary.intersection(geom.boundary).length)
+        except Exception:
+            shared = 0.0
+        if shared > 1e-10:
+            contacts.append((shared, name))
+
+    if contacts:
+        contacts.sort(reverse=True)
+        return contacts[0][1]
+
+    tol = max(float(mm_per_px) * 0.75, float(simplify_mm) * 0.18, 1e-6)
+    band = island.buffer(tol)
+    near = []
+    for name in names:
+        if name == original_name:
+            continue
+        geom = stable_partition.get(name)
+        if geom is None or geom.is_empty:
+            continue
+        try:
+            score = float(band.intersection(geom).area)
+        except Exception:
+            score = 0.0
+        if score > 0:
+            near.append((score, name))
+
+    if near:
+        near.sort(reverse=True)
+        return near[0][1]
+
+    return None
+
+
+def _reassign_tiny_embedded_islands(
+    partition: dict,
+    names: list[str],
+    min_area_mm2: float,
+    mm_per_px: float,
+    simplify_mm: float,
+):
+    """Reassign sub-threshold embedded color specks without creating gaps.
+
+    `Min. Island Area` previously cleaned only the global silhouette; tiny
+    wrong-color components inside another color could therefore survive and
+    produce dozens of STL islands. We now apply the threshold to color
+    components too, but only reassign a tiny component when it has a stable
+    neighboring printable color. Truly isolated details are preserved.
+
+    Because every removed component is immediately added to a neighboring group,
+    the union of all color geometries remains exactly unchanged.
+    """
+    try:
+        threshold = float(min_area_mm2)
+    except Exception:
+        return partition
+
+    if not np.isfinite(threshold) or threshold <= 0:
+        return partition
+
+    stable = {}
+    tiny = []
+
+    for name in names:
+        geom = partition.get(name)
+        if geom is None or geom.is_empty:
+            stable[name] = MultiPolygon([])
+            continue
+
+        keep_parts = []
+        for poly in iter_polygons(geom):
+            if float(poly.area) < threshold:
+                tiny.append((float(poly.area), name, poly))
+            else:
+                keep_parts.append(poly)
+
+        if keep_parts:
+            stable[name] = unary_union(keep_parts).buffer(0)
+        else:
+            stable[name] = MultiPolygon([])
+
+    # Process the smallest artifacts first. They are assigned only to stable
+    # neighboring geometry, never to another tiny fragment, preventing chains of
+    # micro-islands from simply changing color together.
+    tiny.sort(key=lambda item: item[0])
+
+    for _, original_name, island in tiny:
+        owner = _choose_small_island_neighbor(
+            island=island,
+            original_name=original_name,
+            names=names,
+            stable_partition=stable,
+            mm_per_px=mm_per_px,
+            simplify_mm=simplify_mm,
+        )
+
+        if owner is None:
+            owner = original_name
+
+        existing = stable.get(owner)
+        if existing is None or existing.is_empty:
+            stable[owner] = island
+        else:
+            stable[owner] = unary_union([existing, island]).buffer(0)
+
+    result = {}
+    for name in names:
+        geom = stable.get(name)
+        if geom is not None and not geom.is_empty:
+            result[name] = geom
+    return result
 
 
 def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
@@ -720,6 +863,17 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
             partition[owner] = unary_union(
                 [g for g in (existing, gap) if g is not None and not g.is_empty]
             ).buffer(0)
+
+    # Remove tiny embedded wrong-color specks according to Min. Island Area,
+    # while transferring their exact geometry to the surrounding stable color.
+    # This preserves the total union and therefore cannot create STL gaps.
+    partition = _reassign_tiny_embedded_islands(
+        partition=partition,
+        names=names,
+        min_area_mm2=min_area_mm2,
+        mm_per_px=mm_per_px,
+        simplify_mm=simplify_mm,
+    )
 
     # Preserve original UI/group order.
     result = {}
