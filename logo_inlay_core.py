@@ -437,6 +437,263 @@ def smooth_group_partition(label_img: np.ndarray, groups: dict,
     return names, out, smoothed_active
 
 
+
+def _stable_raster_components(group_map: np.ndarray, min_area_px: int):
+    """Return a map containing only stable (non-tiny) 4-connected components.
+
+    Pixels belonging to tiny components are -1. This lets tiny artifacts choose
+    only genuinely stable neighboring colors instead of one tiny artifact
+    pulling another tiny artifact into the wrong group.
+    """
+    stable = np.full(group_map.shape, -1, dtype=np.int16)
+    threshold = max(1, int(min_area_px))
+
+    gids = [int(v) for v in np.unique(group_map) if int(v) >= 0]
+    for gid in gids:
+        mask = (group_map == gid).astype(np.uint8)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask, connectivity=4
+        )
+        for cid in range(1, count):
+            area = int(stats[cid, cv2.CC_STAT_AREA])
+            if area >= threshold:
+                stable[labels == cid] = gid
+    return stable
+
+
+def _component_edge_neighbor_counts(
+    component_mask: np.ndarray,
+    stable_group_map: np.ndarray,
+):
+    """Count real shared pixel EDGES from a component to stable print colors."""
+    component_mask = np.asarray(component_mask, dtype=bool)
+    h, w = component_mask.shape
+    counts = {}
+
+    ys, xs = np.nonzero(component_mask)
+    for y, x in zip(ys, xs):
+        if y > 0 and not component_mask[y - 1, x]:
+            gid = int(stable_group_map[y - 1, x])
+            if gid >= 0:
+                counts[gid] = counts.get(gid, 0) + 1
+        if y + 1 < h and not component_mask[y + 1, x]:
+            gid = int(stable_group_map[y + 1, x])
+            if gid >= 0:
+                counts[gid] = counts.get(gid, 0) + 1
+        if x > 0 and not component_mask[y, x - 1]:
+            gid = int(stable_group_map[y, x - 1])
+            if gid >= 0:
+                counts[gid] = counts.get(gid, 0) + 1
+        if x + 1 < w and not component_mask[y, x + 1]:
+            gid = int(stable_group_map[y, x + 1])
+            if gid >= 0:
+                counts[gid] = counts.get(gid, 0) + 1
+
+    return counts
+
+
+def _component_local_majority_counts(
+    component_mask: np.ndarray,
+    stable_group_map: np.ndarray,
+    candidate_gids,
+    radius_px: int = 2,
+):
+    """Tie-break edge contact using the local stable-color majority around it.
+
+    Candidates are already proven edge-neighbors; this function never adds a new
+    color that did not share an edge with the component.
+    """
+    candidate_gids = {int(v) for v in candidate_gids}
+    if not candidate_gids:
+        return {}
+
+    mask = component_mask.astype(np.uint8)
+    radius = max(1, int(radius_px))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)
+    )
+    dilated = cv2.dilate(mask, kernel, iterations=1).astype(bool)
+    ring = dilated & (~component_mask)
+
+    values = stable_group_map[ring]
+    out = {}
+    for gid in candidate_gids:
+        out[gid] = int(np.count_nonzero(values == gid))
+    return out
+
+
+def _reassign_tiny_raster_components(
+    group_map: np.ndarray,
+    active_mask: np.ndarray,
+    min_area_px: int,
+):
+    """Clean tiny wrong-color raster islands before vectorization.
+
+    Rules:
+      * components are 4-connected;
+      * only colors sharing a REAL PIXEL EDGE are eligible;
+      * the color with the most shared edges wins;
+      * a local-majority vote is used only to break a true edge-count tie;
+      * diagonal/non-touching colors are never candidates;
+      * components surrounded only by background are preserved.
+
+    Performance:
+      Each tiny component is processed only inside its own small bounding box,
+      rather than allocating a full-image mask per component. This keeps the
+      cleanup practical even when a high-resolution logo contains hundreds or
+      thousands of tiny artifacts.
+    """
+    threshold = max(1, int(min_area_px))
+    original = np.asarray(group_map, dtype=np.int16)
+    if threshold <= 1:
+        return original.copy()
+
+    result = original.copy()
+    stable_map = _stable_raster_components(original, threshold)
+    image_h, image_w = original.shape
+
+    gids = [int(v) for v in np.unique(original) if int(v) >= 0]
+
+    for gid in gids:
+        mask = (original == gid).astype(np.uint8)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask, connectivity=4
+        )
+
+        for cid in range(1, count):
+            area = int(stats[cid, cv2.CC_STAT_AREA])
+            if area >= threshold:
+                continue
+
+            x = int(stats[cid, cv2.CC_STAT_LEFT])
+            y = int(stats[cid, cv2.CC_STAT_TOP])
+            cw = int(stats[cid, cv2.CC_STAT_WIDTH])
+            ch = int(stats[cid, cv2.CC_STAT_HEIGHT])
+
+            # Two pixels of padding support direct edge counting plus the
+            # radius-2 tie-break neighborhood.
+            pad = 2
+            x0 = max(0, x - pad)
+            y0 = max(0, y - pad)
+            x1 = min(image_w, x + cw + pad)
+            y1 = min(image_h, y + ch + pad)
+
+            cc_roi = labels[y0:y1, x0:x1]
+            component = cc_roi == cid
+            stable_roi = stable_map[y0:y1, x0:x1]
+
+            edge_counts = _component_edge_neighbor_counts(
+                component, stable_roi
+            )
+            edge_counts = {
+                ngid: score
+                for ngid, score in edge_counts.items()
+                if ngid >= 0 and ngid != gid and score > 0
+            }
+
+            if not edge_counts:
+                # Isolated tiny detail in background: preserve it.
+                continue
+
+            best_edges = max(edge_counts.values())
+            tied = [
+                ngid for ngid, score in edge_counts.items()
+                if score == best_edges
+            ]
+
+            if len(tied) == 1:
+                owner = tied[0]
+            else:
+                local_counts = _component_local_majority_counts(
+                    component,
+                    stable_roi,
+                    tied,
+                    radius_px=2,
+                )
+                best_local = max(local_counts.get(v, 0) for v in tied)
+                tied2 = [
+                    v for v in tied
+                    if local_counts.get(v, 0) == best_local
+                ]
+                owner = min(tied2)
+
+            result_roi = result[y0:y1, x0:x1]
+            result_roi[component] = int(owner)
+
+    result[~np.asarray(active_mask, dtype=bool)] = -1
+    return result
+
+
+
+def _polygon_raster_edge_neighbor_counts(
+    polygon: Polygon,
+    group_map: np.ndarray,
+    mm_per_px: float,
+):
+    """Count direct 4-neighbor raster colors around a vector gap polygon.
+
+    This examines the ring immediately OUTSIDE the rasterized gap. It therefore
+    answers the useful question for gap filling: "which colors actually surround
+    this hole, and how much of its local boundary do they occupy?"
+    """
+    if polygon is None or polygon.is_empty or polygon.area <= 0 or mm_per_px <= 0:
+        return {}
+
+    h, w = group_map.shape
+    minx, miny, maxx, maxy = polygon.bounds
+
+    # Two pixels of padding are enough to capture a direct 4-neighbor ring.
+    x0 = max(0, int(np.floor(minx / mm_per_px)) - 2)
+    x1 = min(w - 1, int(np.ceil(maxx / mm_per_px)) + 2)
+    y0 = max(0, int(np.floor(h - (maxy / mm_per_px))) - 2)
+    y1 = min(h - 1, int(np.ceil(h - (miny / mm_per_px))) + 2)
+
+    if x1 < x0 or y1 < y0:
+        return {}
+
+    local = np.zeros((y1 - y0 + 1, x1 - x0 + 1), dtype=np.uint8)
+
+    def ring_to_pixels(ring):
+        pts = []
+        for x, y in ring.coords:
+            px = int(round(x / mm_per_px)) - x0
+            py = int(round(h - (y / mm_per_px))) - y0
+            pts.append([px, py])
+        return np.asarray(pts, dtype=np.int32)
+
+    try:
+        outer = ring_to_pixels(polygon.exterior)
+        if len(outer) >= 3:
+            cv2.fillPoly(local, [outer], 1)
+        for hole in polygon.interiors:
+            pts = ring_to_pixels(hole)
+            if len(pts) >= 3:
+                cv2.fillPoly(local, [pts], 0)
+    except Exception:
+        return {}
+
+    inside = local.astype(bool)
+    if not np.any(inside):
+        return {}
+
+    # Cross kernel = strict edge adjacency. Diagonals do not count.
+    cross = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    dilated = cv2.dilate(local, cross, iterations=1).astype(bool)
+    ring = dilated & (~inside)
+
+    values = group_map[y0:y1 + 1, x0:x1 + 1][ring]
+    values = values[values >= 0]
+    if values.size == 0:
+        return {}
+
+    ids, counts = np.unique(values.astype(np.int32), return_counts=True)
+    return {
+        int(gid): int(count)
+        for gid, count in zip(ids, counts)
+        if int(count) > 0
+    }
+
+
 def _gap_pixel_vote(gap: Polygon, group_map: np.ndarray, mm_per_px: float):
     """Return the raster group id that locally owns most of a vectorization gap.
 
@@ -501,16 +758,62 @@ def _choose_local_gap_owner(
     raw: dict,
     simplify_mm: float,
 ):
-    """Choose the most plausible local color owner for a vectorization gap.
+    """Choose a vector-gap owner from proven physical adjacency only.
 
-    Continuity is the primary signal. A raster vote may break a near tie, but a
-    weak one-pixel vote is no longer allowed to override a much stronger shared
-    boundary with another color. That was the source of occasional green/red
-    micro-specks along otherwise black/white edges.
+    V8.1 final rules:
+      1. Direct 4-neighbor raster ring: most represented color wins.
+      2. An exact tie may be broken by shared vector-boundary length, but only
+         between those same directly adjacent raster colors.
+      3. If the raster ring cannot represent a sub-pixel gap, a TRUE shared
+         vector boundary may be used.
+      4. Otherwise return None and report the unresolved gap.
+
+    No inside-gap vote, distance search, RGB search, near-color search or
+    largest-group fallback remains.
     """
-    gid = _gap_pixel_vote(gap, group_map, mm_per_px)
-    voted = names[gid] if gid is not None and 0 <= gid < len(names) else None
+    if gap is None or gap.is_empty or gap.area <= 0:
+        return None
 
+    # 1) Strict direct-edge raster neighborhood.
+    raster_counts = _polygon_raster_edge_neighbor_counts(
+        gap, group_map, mm_per_px
+    )
+    if raster_counts:
+        valid = [
+            (int(count), int(gid), names[int(gid)])
+            for gid, count in raster_counts.items()
+            if 0 <= int(gid) < len(names) and int(count) > 0
+        ]
+        if valid:
+            best_count = max(count for count, _, _ in valid)
+            tied = [
+                (gid, name)
+                for count, gid, name in valid
+                if count == best_count
+            ]
+
+            if len(tied) == 1:
+                return tied[0][1]
+
+            # Exact tie only. No new candidate can enter here.
+            boundary_scores = []
+            for gid, name in tied:
+                geom = partition.get(name)
+                if geom is None or geom.is_empty:
+                    shared = 0.0
+                else:
+                    try:
+                        shared = float(
+                            gap.boundary.intersection(geom.boundary).length
+                        )
+                    except Exception:
+                        shared = 0.0
+                boundary_scores.append((shared, name))
+
+            boundary_scores.sort(key=lambda item: (-item[0], item[1]))
+            return boundary_scores[0][1]
+
+    # 2) True shared vector boundary is also proven physical adjacency.
     exact_contacts = []
     for name in names:
         geom = partition.get(name)
@@ -524,80 +827,12 @@ def _choose_local_gap_owner(
             exact_contacts.append((shared, name))
 
     if exact_contacts:
-        exact_contacts.sort(reverse=True)
-        best_score, best_name = exact_contacts[0]
+        exact_contacts.sort(key=lambda item: (-item[0], item[1]))
+        return exact_contacts[0][1]
 
-        # Let the raster vote decide only when it is genuinely competitive with
-        # the strongest geometric neighbor.
-        if voted is not None:
-            voted_score = next(
-                (score for score, name in exact_contacts if name == voted),
-                0.0,
-            )
-            if voted_score >= best_score * 0.80:
-                return voted
-        return best_name
-
-    # Numerical simplification can leave a microscopic separation. Measure a
-    # narrow contact band and again prefer its strongest local neighbor.
-    tol = max(float(mm_per_px) * 0.55, float(simplify_mm) * 0.12, 1e-6)
-    band = gap.buffer(tol)
-    near_contacts = []
-    for name in names:
-        geom = partition.get(name)
-        if geom is None or geom.is_empty:
-            continue
-        try:
-            score = float(band.intersection(geom).area)
-        except Exception:
-            score = 0.0
-        if score > 0:
-            near_contacts.append((score, name))
-
-    if near_contacts:
-        near_contacts.sort(reverse=True)
-        best_score, best_name = near_contacts[0]
-        if voted is not None:
-            voted_score = next(
-                (score for score, name in near_contacts if name == voted),
-                0.0,
-            )
-            if voted_score >= best_score * 0.80:
-                return voted
-        return best_name
-
-    # Only when geometry offers no local neighbor at all do we fall back to the
-    # smoothed raster ownership map.
-    if voted is not None:
-        geom = raw.get(voted)
-        if geom is not None and not geom.is_empty:
-            return voted
-
-    distances = []
-    probe = gap.representative_point()
-    for name in names:
-        geom = partition.get(name)
-        if geom is None or geom.is_empty:
-            geom = raw.get(name)
-        if geom is None or geom.is_empty:
-            continue
-        try:
-            distances.append((float(probe.distance(geom)), name))
-        except Exception:
-            pass
-
-    if distances:
-        distances.sort(key=lambda item: item[0])
-        return distances[0][1]
-
-    candidates = [
-        (float(raw[name].area), name)
-        for name in names
-        if name in raw and raw[name] is not None and not raw[name].is_empty
-    ]
-    if candidates:
-        return max(candidates)[1]
+    # 3) No proof of adjacency -> never invent an owner.
     return None
+
 
 
 def _choose_small_island_neighbor(
@@ -608,11 +843,12 @@ def _choose_small_island_neighbor(
     mm_per_px: float,
     simplify_mm: float,
 ):
-    """Choose a surrounding stable color for a tiny embedded color island.
+    """Choose a surrounding stable color using true shared boundary only.
 
-    Returning None means the island has no meaningful neighboring printable
-    color (for example an intentionally isolated dot in a separate silhouette);
-    such an island is preserved in its original group.
+    Raster-level cleanup already handles pixel artifacts before vectorization.
+    This second vector-level safety net therefore reassigns an island only when
+    another stable print color physically shares its boundary. The longest
+    shared boundary wins. Otherwise the detail stays in its original color.
     """
     contacts = []
     for name in names:
@@ -629,30 +865,11 @@ def _choose_small_island_neighbor(
             contacts.append((shared, name))
 
     if contacts:
-        contacts.sort(reverse=True)
+        contacts.sort(key=lambda item: (-item[0], item[1]))
         return contacts[0][1]
 
-    tol = max(float(mm_per_px) * 0.75, float(simplify_mm) * 0.18, 1e-6)
-    band = island.buffer(tol)
-    near = []
-    for name in names:
-        if name == original_name:
-            continue
-        geom = stable_partition.get(name)
-        if geom is None or geom.is_empty:
-            continue
-        try:
-            score = float(band.intersection(geom).area)
-        except Exception:
-            score = 0.0
-        if score > 0:
-            near.append((score, name))
-
-    if near:
-        near.sort(reverse=True)
-        return near[0][1]
-
     return None
+
 
 
 def _reassign_tiny_embedded_islands(
@@ -760,6 +977,15 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
     if not np.any(active_mask):
         return {}, MultiPolygon([])
 
+    # V8.1: eliminate tiny wrong-color raster components BEFORE vectorization.
+    # A component can only move to a stable color sharing a real 4-neighbor
+    # pixel edge, and the strongest surrounding edge count wins.
+    group_map = _reassign_tiny_raster_components(
+        group_map=group_map,
+        active_mask=active_mask,
+        min_area_px=min_area_px,
+    )
+
     # Clean only the global active mask. This avoids deleting individual color
     # fragments in a way that would create gaps between neighboring colors.
     master_mask = clean_mask(active_mask, min_area_px, close_strength)
@@ -813,31 +1039,59 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
     # Allocate each connected gap locally instead of gifting all of it to the
     # dominant color.
     if not remaining.is_empty and remaining.area > 0:
-        gaps_by_owner = {}
-        for gap in iter_polygons(remaining):
-            if gap.is_empty or gap.area <= 0:
-                continue
+        pending_gaps = [
+            gap for gap in iter_polygons(remaining)
+            if not gap.is_empty and gap.area > 0
+        ]
 
-            owner = _choose_local_gap_owner(
-                gap=gap,
-                names=names,
-                group_map=group_map,
-                mm_per_px=mm_per_px,
-                partition=partition,
-                raw=raw,
-                simplify_mm=simplify_mm,
+        # Two local passes: assigning clear gaps can make exact boundaries
+        # available for neighboring sub-gaps on the next pass.
+        for _pass in range(2):
+            if not pending_gaps:
+                break
+
+            next_pending = []
+            gaps_by_owner = {}
+
+            for gap in pending_gaps:
+                owner = _choose_local_gap_owner(
+                    gap=gap,
+                    names=names,
+                    group_map=group_map,
+                    mm_per_px=mm_per_px,
+                    partition=partition,
+                    raw=raw,
+                    simplify_mm=simplify_mm,
+                )
+                if owner is None:
+                    next_pending.append(gap)
+                else:
+                    gaps_by_owner.setdefault(owner, []).append(gap)
+
+            for owner, gaps in gaps_by_owner.items():
+                existing = partition.get(owner)
+                pieces = (
+                    [existing]
+                    if existing is not None and not existing.is_empty
+                    else []
+                )
+                pieces.extend(gaps)
+                merged = unary_union(pieces).buffer(0)
+                if not merged.is_empty:
+                    partition[owner] = merged
+
+            pending_gaps = next_pending
+
+        # Never invent a remote color to maintain a mathematically exact fill.
+        # If a meaningful gap somehow has no local neighbor, report it instead.
+        unresolved_area = float(sum(g.area for g in pending_gaps))
+        if unresolved_area > 1e-9:
+            raise RuntimeError(
+                "Local partitioning found a vectorization gap of "
+                f"{unresolved_area:.8f} mm² with no physically adjacent print "
+                "color. The gap was not assigned to a random/remote color. "
+                "Try a higher Geometry Resolution or lower Contour Simplification."
             )
-            if owner is None:
-                continue
-            gaps_by_owner.setdefault(owner, []).append(gap)
-
-        for owner, gaps in gaps_by_owner.items():
-            existing = partition.get(owner)
-            pieces = ([existing] if existing is not None and not existing.is_empty else [])
-            pieces.extend(gaps)
-            merged = unary_union(pieces).buffer(0)
-            if not merged.is_empty:
-                partition[owner] = merged
 
     # Numerical safety net. This should normally be effectively zero area.
     union_partition = unary_union(
@@ -846,7 +1100,7 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
     final_missing = total.difference(union_partition).buffer(0)
 
     if not final_missing.is_empty and final_missing.area > 1e-10:
-        # Even this last-resort path is local per connected component.
+        unresolved = []
         for gap in list(iter_polygons(final_missing)):
             owner = _choose_local_gap_owner(
                 gap=gap,
@@ -858,11 +1112,20 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
                 simplify_mm=simplify_mm,
             )
             if owner is None:
+                unresolved.append(gap)
                 continue
             existing = partition.get(owner)
             partition[owner] = unary_union(
                 [g for g in (existing, gap) if g is not None and not g.is_empty]
             ).buffer(0)
+
+        unresolved_area = float(sum(g.area for g in unresolved))
+        if unresolved_area > 1e-9:
+            raise RuntimeError(
+                "Final partition contains "
+                f"{unresolved_area:.8f} mm² that has no local adjacent print "
+                "color. V8.1 refuses to assign that area globally."
+            )
 
     # Remove tiny embedded wrong-color specks according to Min. Island Area,
     # while transferring their exact geometry to the surrounding stable color.
