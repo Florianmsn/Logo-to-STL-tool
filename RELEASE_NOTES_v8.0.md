@@ -73,3 +73,43 @@ dist/Logo to STL Tool 8.0.exe
 ---
 
 Developed by **Florian Hesse** with development assistance from **ChatGPT by OpenAI**.
+
+
+
+## AUTO Adjacency Regression Fix
+
+AUTO distribution has been rewritten to remove the remaining non-adjacent color regression.
+
+The previous resolver used 8-neighbor connectivity and a global safety fallback. This meant a diagonally placed color could be treated as a neighbor, and an isolated AUTO region could eventually be assigned to a remote color.
+
+The corrected behavior is strict:
+
+- only colors sharing a real pixel **edge** with the AUTO region are valid candidates
+- diagonal-only colors are ignored
+- separate AUTO patches that touch only diagonally remain separate
+- propagation is geodesic inside the same AUTO region
+- a non-touching color elsewhere in the logo can never jump into the region
+- isolated AUTO is left unresolved instead of being guessed
+
+If isolated AUTO remains, the application now reports the number of isolated regions and pixels and asks for manual assignment.
+
+### Regression reproduction
+
+A test case was built where one AUTO pixel touched:
+
+- Red by a real edge
+- White by a real edge
+- Blue only diagonally
+
+The previous V8 resolver selected **Blue** because diagonal contact was accepted and the AUTO RGB was blue-like.
+
+The corrected resolver selected only **Red or White**. Blue was completely excluded from the candidate set.
+
+Additional tests verified that:
+
+- a nearby but non-touching color never receives AUTO pixels
+- diagonally touching AUTO patches do not contaminate one another
+- safely resolved AUTO rows are removed from STL export
+- isolated AUTO is blocked before STL Preview / Export instead of being guessed
+- Manual → Calculate follows the same strict rule
+- a 1600 × 1600 synthetic AUTO stress test with many components completed successfully

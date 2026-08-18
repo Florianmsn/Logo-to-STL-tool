@@ -1278,7 +1278,7 @@ class App(tk.Tk):
         ).grid(row=0, column=9, padx=2)
         ToolTip(
             self.quick_frame.winfo_children()[-2],
-            "AUTO: assign transition pixels locally to the most plausible neighboring print color when Calculate is pressed."
+            "AUTO: distribute transition pixels only to print colors that share a real edge with the AUTO region. Diagonal or non-touching colors are ignored."
         )
         ToolTip(
             self.quick_frame.winfo_children()[-1],
@@ -2108,7 +2108,7 @@ class App(tk.Tk):
             command=lambda: self.set_manual_target("auto verteilen"),
         )
         auto_btn.pack(side="left", padx=(8, 2))
-        ToolTip(auto_btn, "AUTO: when Calculate is pressed, distribute these pixels to the most plausible neighboring print color.")
+        ToolTip(auto_btn, "AUTO: when Calculate is pressed, distribute these pixels only to print colors sharing a real edge. Diagonal/non-touching colors are never guessed.")
         self.manual_target_buttons["auto verteilen"] = auto_btn
 
         bg_rgb = self.manual_background_rgb()
@@ -2198,6 +2198,7 @@ class App(tk.Tk):
         self.status.set("Calculating manual edits and AUTO regions…")
 
         try:
+            import cv2
             draft = self.manual_label_img.copy()
             plan = self.get_color_plan()
 
@@ -2220,9 +2221,19 @@ class App(tk.Tk):
                 and str(item.get("group", "")).strip().lower() == "auto verteilen"
             }
             if auto_ids and np.any(np.isin(resolved, list(auto_ids))):
+                unresolved_mask = np.isin(resolved, list(auto_ids))
+                count, _ = cv2.connectedComponents(
+                    unresolved_mask.astype(np.uint8), connectivity=4
+                )
+                components = max(0, int(count) - 1)
+                pixels = int(np.sum(unresolved_mask))
                 raise ValueError(
-                    "AUTO could not be fully resolved. Make sure at least one normal "
-                    "print-color group is active next to the AUTO regions."
+                    "AUTO could not resolve "
+                    f"{components} isolated region(s) / {pixels} pixel(s). "
+                    "AUTO now uses only print colors that share a real pixel edge "
+                    "with the AUTO region. Diagonal or non-touching colors are "
+                    "never guessed. Assign the isolated region manually or connect "
+                    "it to the intended neighboring print color."
                 )
 
             # The Manual tab must also display/use the calculated result afterwards.

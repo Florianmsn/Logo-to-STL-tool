@@ -92,3 +92,76 @@ dist/Logo to STL Tool 8.0.exe
 ## Result
 
 All targeted corrected-V8 regression tests passed.
+
+
+
+## AUTO Adjacency Regression Tests
+
+The reported AUTO regression was reproduced directly.
+
+### Diagonal distractor
+
+Topology:
+
+- AUTO pixel
+- Red sharing a horizontal/vertical edge
+- White sharing a horizontal/vertical edge
+- Blue touching only diagonally
+
+Result:
+
+```text
+Previous V8 resolver: Blue
+Corrected resolver: Red/White only
+```
+
+Blue is no longer a valid candidate.
+
+### Non-touching color
+
+An AUTO strip was placed between Red and White while Blue existed nearby but was separated by another color row.
+
+Result:
+
+```text
+AUTO output colors: Red / White only
+Blue assignments: 0
+```
+
+### Diagonally touching AUTO components
+
+Two AUTO pixels touched only at a corner. One physically bordered Red and the other physically bordered Green.
+
+Result:
+
+```text
+First AUTO component -> Red
+Second AUTO component -> Green
+```
+
+No cross-contamination occurred.
+
+### Isolated AUTO
+
+An AUTO region with no shared print-color edge was tested.
+
+Result:
+
+```text
+Global guess: disabled
+AUTO remains unresolved
+Preview / Export: blocked with explicit message
+Manual Calculate: explicit error
+```
+
+### Performance
+
+A synthetic `1600 × 1600` label image containing 80 separate AUTO transition components was processed.
+
+Result in the automated environment:
+
+```text
+approximately 1.85 seconds
+```
+
+All AUTO pixels resolved only to their real neighboring Red/White groups; Blue/Green non-neighbors received zero AUTO pixels.

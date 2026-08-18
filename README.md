@@ -69,6 +69,28 @@ A sub-threshold embedded island is transferred to the strongest stable neighbori
 
 A truly isolated small detail with no neighboring print color is preserved.
 
+
+## V8 Final AUTO Adjacency Fix
+
+AUTO now follows a strict physical-neighbor rule.
+
+A print color may receive AUTO pixels only when it shares a **real pixel edge** with the same connected AUTO region.
+
+Important behavior:
+
+- edge contact counts
+- diagonal-only contact does **not** count
+- a color elsewhere in the logo cannot become an AUTO candidate
+- propagation stays inside the same 4-connected AUTO region
+- if multiple edge-adjacent print colors border an AUTO region, AUTO is split by the shortest path to those real contact edges
+- RGB similarity is used only to break an exact distance tie between already-valid neighboring colors
+- an isolated AUTO region with no print-color edge is **not guessed**
+
+If isolated AUTO remains, Calculate / STL Preview / Export reports it clearly and asks for manual assignment instead of silently choosing an unrelated color.
+
+This deliberately replaces the older global-nearest safety fallback that could produce apparently random non-adjacent colors.
+
+
 ## Manual Workflow
 
 Manual edits remain draft-only until **Calculate** is pressed.

@@ -1243,23 +1243,25 @@ def extract_background_groups(label_img, color_plan):
 
 
 def redistribute_auto_groups(label_img, color_plan):
-    """Resolve 'auto verteilen' locally inside each connected AUTO region.
+    """Resolve AUTO only from genuinely edge-adjacent printable colors.
 
-    Rules:
-    1. A printable group may take over an AUTO component only if it actually
-       touches that connected AUTO component.
-    2. Assignment then propagates from those contact edges through the AUTO
-       region using geodesic distance inside the AUTO region.
-    3. Therefore a nearby color separated by background or another region
-       cannot "jump across" and steal AUTO pixels.
+    V8 Final AUTO fix:
+      * 4-neighbor connectivity is used for AUTO components.
+      * Only print colors sharing a real pixel EDGE with an AUTO component are
+        allowed to own pixels from that component.
+      * Diagonal contact does NOT count as adjacency.
+      * Each eligible print color propagates geodesically through the AUTO
+        component from its own real contact edge.
+      * A print color elsewhere in the logo can never jump into the component.
+      * If an AUTO component has no edge contact with any printable color, it is
+        deliberately left unresolved instead of being guessed globally.
 
-    This is designed for anti-aliasing / transition tones around logos.
+    This matches the intended anti-aliasing workflow: AUTO distributes transition
+    pixels between the colors that physically border that transition region.
     """
     import cv2
     import numpy as np
-    import heapq
-    import math
-    from collections import Counter
+    from collections import deque
 
     labels = np.array(label_img, copy=True)
     plan = [dict(item) for item in color_plan]
@@ -1282,9 +1284,13 @@ def redistribute_auto_groups(label_img, color_plan):
     auto_clusters = {int(item["cluster"]) for item in auto_items}
     auto_mask = np.isin(labels, list(auto_clusters))
     if not np.any(auto_mask):
+        # No AUTO pixels remain, so the AUTO source rows no longer export.
+        for item in plan:
+            if int(item["cluster"]) in auto_clusters:
+                item["enabled"] = False
         return labels, plan
 
-    # Group multiple detected colors which already belong to the same print group.
+    # Multiple detected shades may already belong to the same print group.
     groups = {}
     cluster_rgb = {}
     for item in printable_items + auto_items:
@@ -1300,12 +1306,12 @@ def redistribute_auto_groups(label_img, color_plan):
     group_cluster_ids = [groups[name] for name in group_names]
     representative_cluster = [ids[0] for ids in group_cluster_ids]
 
-    # Map every printable source pixel to its destination group id.
     print_gid = np.full(labels.shape, -1, dtype=np.int16)
     for gid, cluster_ids in enumerate(group_cluster_ids):
         print_gid[np.isin(labels, cluster_ids)] = gid
 
-    # Average RGB per printable group for tie-breaking at a shared boundary.
+    # RGB is used ONLY as a deterministic tie-breaker when two genuinely
+    # adjacent colors are at exactly the same geodesic distance.
     group_rgb = []
     for cluster_ids in group_cluster_ids:
         rgbs = [cluster_rgb[c] for c in cluster_ids if c in cluster_rgb]
@@ -1314,16 +1320,14 @@ def redistribute_auto_groups(label_img, color_plan):
         else:
             group_rgb.append(np.array([128, 128, 128], dtype=np.float32))
 
+    # 4-connectivity is intentional: diagonal touching must not merge separate
+    # AUTO patches or make a diagonally placed print color a valid neighbor.
     num_components, component_labels = cv2.connectedComponents(
-        auto_mask.astype(np.uint8), connectivity=8
+        auto_mask.astype(np.uint8), connectivity=4
     )
 
-    neighbors = [
-        (-1, -1, math.sqrt(2.0)), (-1, 0, 1.0), (-1, 1, math.sqrt(2.0)),
-        (0, -1, 1.0),                              (0, 1, 1.0),
-        (1, -1, math.sqrt(2.0)),  (1, 0, 1.0),  (1, 1, math.sqrt(2.0)),
-    ]
     h, w = labels.shape
+    edge_neighbors = [(-1, 0), (0, -1), (0, 1), (1, 0)]
 
     for cid in range(1, num_components):
         comp = component_labels == cid
@@ -1331,131 +1335,112 @@ def redistribute_auto_groups(label_img, color_plan):
         if len(ys) == 0:
             continue
 
-        dist = np.full(labels.shape, np.inf, dtype=np.float32)
-        owner = np.full(labels.shape, -1, dtype=np.int16)
-        heap = []
+        # Work only inside this component's bounding box. This keeps AUTO fast
+        # even on large 1600/1800 px analyses with many small AUTO components.
+        y0, y1 = int(np.min(ys)), int(np.max(ys))
+        x0, x1 = int(np.min(xs)), int(np.max(xs))
+        comp_roi = comp[y0:y1 + 1, x0:x1 + 1]
+        roi_h, roi_w = comp_roi.shape
 
-        # Seed only from AUTO pixels that DIRECTLY touch a printable group.
+        # One seed set per group. A group becomes a candidate ONLY when one of
+        # its pixels shares a real edge with this AUTO component.
+        seeds_by_gid = {}
+
         for y, x in zip(ys, xs):
-            adjacent = []
-            for dy, dx, _ in neighbors:
+            touching = set()
+            for dy, dx in edge_neighbors:
                 ny, nx = y + dy, x + dx
                 if 0 <= ny < h and 0 <= nx < w:
                     gid = int(print_gid[ny, nx])
                     if gid >= 0:
-                        adjacent.append(gid)
+                        touching.add(gid)
 
-            if not adjacent:
-                continue
+            for gid in touching:
+                seeds_by_gid.setdefault(gid, []).append(
+                    (int(y - y0), int(x - x0))
+                )
 
-            counts = Counter(adjacent)
-            best_count = max(counts.values())
-            candidates = [gid for gid, count in counts.items() if count == best_count]
+        # No true edge-adjacent print color -> do not invent one.
+        if not seeds_by_gid:
+            continue
 
-            # If two colors touch the same AUTO boundary pixel equally often,
-            # prefer the one whose RGB is closer to that AUTO source tone.
-            source_cluster = int(labels[y, x])
-            source_rgb = cluster_rgb.get(
-                source_cluster, np.array([128, 128, 128], dtype=np.float32)
-            )
-            best_gid = min(
-                candidates,
-                key=lambda gid: float(np.linalg.norm(source_rgb - group_rgb[gid]))
-            )
+        candidate_gids = sorted(seeds_by_gid.keys())
 
-            if dist[y, x] > 0:
-                dist[y, x] = 0.0
-                owner[y, x] = best_gid
-                heapq.heappush(heap, (0.0, y, x, best_gid))
+        # If exactly one print color borders the component, the answer is
+        # unambiguous and no propagation calculation is required.
+        if len(candidate_gids) == 1:
+            gid = candidate_gids[0]
+            labels[comp] = representative_cluster[gid]
+            continue
 
-        if heap:
-            # Geodesic propagation ONLY through this AUTO component.
-            while heap:
-                d, y, x, gid = heapq.heappop(heap)
-                if d > float(dist[y, x]) + 1e-6:
-                    continue
-                if int(owner[y, x]) != gid:
-                    continue
+        # Compute geodesic distance INSIDE this AUTO component for every
+        # edge-adjacent candidate group. This is a multi-source BFS per group.
+        inf = np.iinfo(np.int32).max
+        distance_maps = {}
 
-                for dy, dx, step in neighbors:
-                    ny, nx = y + dy, x + dx
-                    if not (0 <= ny < h and 0 <= nx < w):
+        for gid in candidate_gids:
+            dist = np.full((roi_h, roi_w), inf, dtype=np.int32)
+            q = deque()
+
+            for ly, lx in seeds_by_gid[gid]:
+                if dist[ly, lx] != 0:
+                    dist[ly, lx] = 0
+                    q.append((ly, lx))
+
+            while q:
+                ly, lx = q.popleft()
+                nd = int(dist[ly, lx]) + 1
+                for dy, dx in edge_neighbors:
+                    nly, nlx = ly + dy, lx + dx
+                    if not (0 <= nly < roi_h and 0 <= nlx < roi_w):
                         continue
-                    if not comp[ny, nx]:
+                    if not comp_roi[nly, nlx]:
                         continue
+                    if nd < int(dist[nly, nlx]):
+                        dist[nly, nlx] = nd
+                        q.append((nly, nlx))
 
-                    nd = d + step
-                    old = float(dist[ny, nx])
-                    if nd + 1e-6 < old:
-                        dist[ny, nx] = nd
-                        owner[ny, nx] = gid
-                        heapq.heappush(heap, (nd, ny, nx, gid))
-                    elif abs(nd - old) <= 1e-6 and int(owner[ny, nx]) != gid:
-                        # Stable tie: prefer the closer RGB group for this AUTO tone.
-                        source_cluster = int(labels[ny, nx])
-                        source_rgb = cluster_rgb.get(
-                            source_cluster, np.array([128, 128, 128], dtype=np.float32)
-                        )
-                        current_gid = int(owner[ny, nx])
-                        if current_gid < 0 or np.linalg.norm(
-                            source_rgb - group_rgb[gid]
-                        ) < np.linalg.norm(source_rgb - group_rgb[current_gid]):
-                            owner[ny, nx] = gid
+            distance_maps[gid] = dist
 
-            for gid, cluster in enumerate(representative_cluster):
-                mask = comp & (owner == gid)
-                labels[mask] = cluster
-        else:
-            # Rare fallback: isolated AUTO component touches no printable color.
-            # Use nearest printable group globally only in this exceptional case.
-            component_coords = np.column_stack((ys, xs))
-            best_gid_for_component = None
-            best_dist = np.inf
+        # Resolve every AUTO pixel using only the eligible edge-adjacent groups.
+        for y, x in zip(ys, xs):
+            ly, lx = int(y - y0), int(x - x0)
+            best_distance = min(
+                int(distance_maps[gid][ly, lx]) for gid in candidate_gids
+            )
+            tied = [
+                gid for gid in candidate_gids
+                if int(distance_maps[gid][ly, lx]) == best_distance
+            ]
 
-            cy = float(np.mean(ys))
-            cx = float(np.mean(xs))
-            for gid in range(len(group_names)):
-                gy, gx = np.nonzero(print_gid == gid)
-                if len(gy) == 0:
-                    continue
-                squared = (gy.astype(np.float32) - cy) ** 2 + (
-                    gx.astype(np.float32) - cx
-                ) ** 2
-                d = float(np.min(squared))
-                if d < best_dist:
-                    best_dist = d
-                    best_gid_for_component = gid
+            if len(tied) == 1:
+                best_gid = tied[0]
+            else:
+                source_cluster = int(labels[y, x])
+                source_rgb = cluster_rgb.get(
+                    source_cluster,
+                    np.array([128, 128, 128], dtype=np.float32),
+                )
+                best_gid = min(
+                    tied,
+                    key=lambda gid: (
+                        float(np.linalg.norm(source_rgb - group_rgb[gid])),
+                        gid,
+                    ),
+                )
 
-            if best_gid_for_component is not None:
-                labels[comp] = representative_cluster[best_gid_for_component]
+            labels[y, x] = representative_cluster[best_gid]
 
-    # Safety fallback:
-    # A connected AUTO component should normally be fully resolved above.
-    # If any AUTO pixels remain (e.g. unusual isolated topology), assign only
-    # those leftovers to the spatially nearest printable group. This guarantees
-    # that a successful calculation never leaves grey/AUTO pixels behind.
+    # Only disable AUTO source rows when every AUTO pixel was safely resolved.
+    # If isolated AUTO remains, callers can report it instead of exporting a
+    # silently guessed/wrong color.
     remaining_auto = np.isin(labels, list(auto_clusters))
-    if np.any(remaining_auto):
-        distance_maps = []
-        for cluster_ids in group_cluster_ids:
-            group_mask = np.isin(labels, cluster_ids).astype(np.uint8)
-            inv = np.where(group_mask > 0, 0, 1).astype(np.uint8)
-            distance_maps.append(cv2.distanceTransform(inv, cv2.DIST_L2, 5))
-
-        if distance_maps:
-            nearest = np.argmin(np.stack(distance_maps, axis=0), axis=0)
-            ys, xs = np.nonzero(remaining_auto)
-            for y, x in zip(ys, xs):
-                gid = int(nearest[y, x])
-                labels[y, x] = representative_cluster[gid]
-
-    # AUTO never exports as its own STL.
-    for item in plan:
-        if int(item["cluster"]) in auto_clusters:
-            item["enabled"] = False
+    if not np.any(remaining_auto):
+        for item in plan:
+            if int(item["cluster"]) in auto_clusters:
+                item["enabled"] = False
 
     return labels, plan
-
 
 def upscale_geometry_grid(label_img, explicit_background_mask=None, target_pixels=1600):
     """Upscale the already-classified label map for smoother vector geometry.
@@ -1646,6 +1631,29 @@ def _prepare_partition_geometry(
         label_img[manual_bg] = -1
 
     label_img, plan = redistribute_auto_groups(label_img, plan)
+
+    unresolved_auto_ids = {
+        int(item["cluster"])
+        for item in plan
+        if item.get("enabled", True)
+        and str(item.get("group", "")).strip().lower() == "auto verteilen"
+    }
+    if unresolved_auto_ids:
+        unresolved_mask = np.isin(label_img, list(unresolved_auto_ids))
+        if np.any(unresolved_mask):
+            count, _ = cv2.connectedComponents(
+                unresolved_mask.astype(np.uint8), connectivity=4
+            )
+            components = max(0, int(count) - 1)
+            pixels = int(np.sum(unresolved_mask))
+            raise ValueError(
+                "AUTO contains "
+                f"{components} isolated region(s) / {pixels} pixel(s) that do not "
+                "share an edge with any active print color. They were left AUTO "
+                "instead of being guessed. Assign those regions manually or make "
+                "them touch the intended print color, then Calculate again."
+            )
+
     label_img, explicit_background_mask = upscale_geometry_grid(
         label_img, explicit_background_mask, geometry_pixels
     )
