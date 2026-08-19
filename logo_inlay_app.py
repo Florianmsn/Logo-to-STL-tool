@@ -13,7 +13,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
 from PIL import Image, ImageTk
 import numpy as np
 
-from logo_inlay_core import analyze_colors, generate_logo_stls, build_partition_preview, redistribute_auto_groups, cleanup_small_color_islands
+from logo_inlay_core import analyze_colors, generate_logo_stls, build_partition_preview, finalize_color_map
 
 try:
     from logo_inlay_core import guess_color_name
@@ -21,7 +21,7 @@ except ImportError:
     from logo_inlay_core import closest_color_name as guess_color_name
 
 
-APP_TITLE = "Logo to STL Tool 8.3"
+APP_TITLE = "Logo to STL Tool 9.0"
 MANUAL_AUTO_LABEL = -2147483000
 APP_DIR = Path.home() / ".logo_inlay_tool"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -35,24 +35,6 @@ BACKGROUND_DISPLAY = {
     "Keep everything": "all",
 }
 BACKGROUND_INTERNAL = {v: k for k, v in BACKGROUND_DISPLAY.items()}
-
-CONTOUR_DISPLAY = {
-    "Straight / crisp": "straight",
-    "Smooth curves": "smooth",
-    "Maximum detail": "detail",
-}
-CONTOUR_INTERNAL = {v: k for k, v in CONTOUR_DISPLAY.items()}
-
-EDGE_SMOOTHING_MIGRATION = {
-    "Aus": "Off",
-    "Leicht": "Light",
-    "Mittel": "Medium",
-    "Stark": "Strong",
-    "Off": "Off",
-    "Light": "Light",
-    "Medium": "Medium",
-    "Strong": "Strong",
-}
 
 PROFILE_NAME_MIGRATION = {
     "Kartenspiel Inlay": "Card Inlay",
@@ -122,13 +104,9 @@ DEFAULT_PROFILES = {
         "height": 0.8,
         "cut": 0.8,
         "clearance": 0.0,
-        "smooth": 0.06,
-        "edge_smoothing": "Medium",
-        "geometry_pixels": 1600,
         "min_area": 0.05,
         "white_threshold": 245,
         "working_pixels": 1800,
-        "contour_mode": "smooth",
         "auto_merge": True,
         "merge_distance": 18.0,
         "background": "transparent",
@@ -144,13 +122,9 @@ DEFAULT_PROFILES = {
         "height": 0.8,
         "cut": 0.8,
         "clearance": 0.0,
-        "smooth": 0.02,
-        "edge_smoothing": "Light",
-        "geometry_pixels": 2000,
         "min_area": 0.03,
         "white_threshold": 245,
         "working_pixels": 2200,
-        "contour_mode": "detail",
         "auto_merge": True,
         "merge_distance": 12.0,
         "background": "transparent",
@@ -166,13 +140,9 @@ DEFAULT_PROFILES = {
         "height": 0.8,
         "cut": 0.8,
         "clearance": 0.0,
-        "smooth": 0.08,
-        "edge_smoothing": "Medium",
-        "geometry_pixels": 1200,
         "min_area": 0.2,
         "white_threshold": 245,
         "working_pixels": 1000,
-        "contour_mode": "straight",
         "auto_merge": True,
         "merge_distance": 22.0,
         "background": "transparent",
@@ -189,9 +159,7 @@ TIP = {
     "cut": "Depth of the cutout / negative body. For a flush insert, this is usually the same as the part height.",
     "clearance": "Extra clearance around the cutout. 0 creates an exact fit; higher values make the opening looser.",
     "background": "Defines what is treated as background. Transparent uses the alpha channel. White removes bright white. Corner color uses the image corners. Outer connected color removes only the matching color connected to the image edge.",
-    "contour": "Controls how vector edges are generated. Straight / crisp is usually best for logos and lettering. Smooth curves favors rounded shapes. Maximum detail keeps more small features but can produce noisier contours.",
-    "smooth": "Simplifies the final vector contour. Higher values reduce tiny edge variations but may remove fine details.",
-    "min_area": "Minimum physical area for tiny embedded color islands. V8.2 applies this already when Calculate is pressed and again during STL geometry generation. Smaller specks are reassigned only to the strongest directly adjacent print color; diagonal/non-touching colors are ignored. Truly isolated details with no neighboring print color are preserved.",
+    "min_area": "Automatic raster cleanup threshold applied only when Calculate is pressed. Tiny analysis artifacts may move only to a stable directly adjacent print color. Manually painted print pixels are protected, and STL geometry never recolors the result later.",
     "deck": "Dimensions of the target surface in millimeters. Used for the final placement preview only.",
 }
 
@@ -432,15 +400,9 @@ class App(tk.Tk):
 
         self.background = tk.StringVar(value=self.settings.get("background", "transparent"))
         self.background_display = tk.StringVar(value=BACKGROUND_INTERNAL.get(self.background.get(), "Transparent background"))
-        self.contour_mode = tk.StringVar(value=self.settings.get("contour_mode", "straight"))
-        self.contour_display = tk.StringVar(value=CONTOUR_INTERNAL.get(self.contour_mode.get(), "Straight / crisp"))
 
         self.white_threshold = tk.IntVar(value=self.settings.get("white_threshold", 245))
         self.working_pixels = tk.IntVar(value=self.settings.get("working_pixels", 1600))
-        self.smooth = tk.DoubleVar(value=self.settings.get("smooth", 0.06))
-        saved_smoothing = self.settings.get("edge_smoothing", "Medium")
-        self.edge_smoothing = tk.StringVar(value=EDGE_SMOOTHING_MIGRATION.get(saved_smoothing, "Medium"))
-        self.geometry_pixels = tk.IntVar(value=self.settings.get("geometry_pixels", 1600))
         self.min_area = tk.DoubleVar(value=self.settings.get("min_area", 0.08))
         self.auto_merge = tk.BooleanVar(value=self.settings.get("auto_merge", True))
         self.merge_distance = tk.DoubleVar(value=self.settings.get("merge_distance", 18.0))
@@ -460,14 +422,20 @@ class App(tk.Tk):
         self._preview_resize_job = None
         self._edit_divider_dragging = False
 
-        # V6 manual editor state
+        # Manual editor draft state. The label image still stores detected
+        # cluster IDs for editing compatibility; Calculate converts it exactly
+        # once into the immutable final print-group map.
         self.manual_label_img = None
         self.manual_background_mask = None
+        self.manual_locked_mask = None
 
-        # "Committed" state is what all expensive processing / STL export uses.
-        # manual_label_img/manual_background_mask are the fast editable draft.
+        # Committed Manual state + immutable final color map.
         self.committed_manual_label_img = None
         self.committed_manual_background_mask = None
+        self.committed_manual_locked_mask = None
+        self.committed_final_group_map = None
+        self.committed_group_defs = None
+        self.committed_finalize_stats = None
         self.manual_changes_pending = False
         self.manual_undo = []
         self.manual_target = tk.StringVar(value="")
@@ -517,6 +485,16 @@ class App(tk.Tk):
         self.target_w.trace_add("write", self._on_target_width_changed)
         self.target_h.trace_add("write", self._on_target_height_changed)
         self.keep_aspect.trace_add("write", self._on_aspect_lock_changed)
+
+        # Min. Island Area is part of final raster calculation in V9. Changing
+        # it requires Calculate again; it is never applied secretly in STL code.
+        self.min_area.trace_add(
+            "write",
+            lambda *args: (
+                self.invalidate_final_color_map(mark_pending=True)
+                if self.analysis is not None else None
+            )
+        )
 
         for var in [self.deckel_w, self.deckel_h, self.deck_color]:
             try:
@@ -581,9 +559,12 @@ class App(tk.Tk):
     def _current_printable_mask(self, label_img=None):
         """Return the current committed printable footprint.
 
-        This is used only for aspect-ratio/display calculations. Manual draft
-        edits do not affect the final size until Calculate is pressed.
+        V9: once Calculate has produced a final print-group map, that frozen map
+        is the source of truth for aspect ratio and all final previews.
         """
+        if label_img is None and self.committed_final_group_map is not None:
+            return np.asarray(self.committed_final_group_map) >= 0
+
         if label_img is None:
             label_img = self.get_effective_label_img()
         if label_img is None:
@@ -805,23 +786,11 @@ class App(tk.Tk):
                 "Logo Height must be greater than 0 mm."
             )
 
-        geometry_pixels = self._safe_var_float(self.geometry_pixels)
         min_area = self._safe_var_float(self.min_area)
-        simplify = self._safe_var_float(self.smooth)
-        if geometry_pixels is None or geometry_pixels < 100:
-            return fail(
-                "Invalid Geometry Setting",
-                "Geometry Resolution must be at least 100 px."
-            )
         if min_area is None or min_area < 0:
             return fail(
-                "Invalid Geometry Setting",
+                "Invalid Cleanup Setting",
                 "Min. Island Area must be 0 mm² or greater."
-            )
-        if simplify is None or simplify < 0:
-            return fail(
-                "Invalid Geometry Setting",
-                "Contour Simplification must be 0 mm or greater."
             )
 
         if for_export:
@@ -857,12 +826,6 @@ class App(tk.Tk):
                         if new_name not in data:
                             data[new_name] = data[old_name]
                         data.pop(old_name, None)
-
-                for profile in data.values():
-                    if isinstance(profile, dict) and "edge_smoothing" in profile:
-                        profile["edge_smoothing"] = EDGE_SMOOTHING_MIGRATION.get(
-                            profile["edge_smoothing"], profile["edge_smoothing"]
-                        )
 
                 merged = dict(DEFAULT_PROFILES)
                 merged.update(data)
@@ -910,12 +873,8 @@ class App(tk.Tk):
             "cut": f(self.cut, 0.8),
             "clearance": f(self.clearance, 0.0),
             "background": self.background.get(),
-            "contour_mode": self.contour_mode.get(),
             "white_threshold": i(self.white_threshold, 245),
             "working_pixels": i(self.working_pixels, 1600),
-            "smooth": f(self.smooth, 0.06),
-            "edge_smoothing": self.edge_smoothing.get(),
-            "geometry_pixels": i(self.geometry_pixels, 1600),
             "min_area": f(self.min_area, 0.08),
             "auto_merge": bool(self.auto_merge.get()),
             "merge_distance": f(self.merge_distance, 18.0),
@@ -1051,53 +1010,44 @@ class App(tk.Tk):
         self.row_entry(geo, "Cutout Depth (mm)", self.cut, TIP["cut"])
         self.row_entry(geo, "Clearance (mm)", self.clearance, TIP["clearance"])
 
-        quality_sec = CollapsibleFrame(root, "Geometry Quality", expanded=False)
+        quality_sec = CollapsibleFrame(root, "Geometry & Cleanup", expanded=False)
         self.geometry_quality_section = quality_sec
         quality_sec.pack(fill="x", pady=(0, 6))
         quality = quality_sec.body
 
-        qrow = ttk.Frame(quality)
-        qrow.pack(fill="x", pady=2)
-        self.label_with_tip(
-            qrow, "Edge smoothing",
-            "Smooths color boundaries, the outer silhouette, and background edges before vectorization. "
-            "Light ≈ 0.10 mm, Medium ≈ 0.22 mm, Strong ≈ 0.45 mm. "
-            "The strength is defined in real millimeters and is independent of analysis resolution."
-        ).pack(side="left")
-        ttk.Combobox(
-            qrow, textvariable=self.edge_smoothing,
-            values=["Off", "Light", "Medium", "Strong"],
-            state="readonly", width=10
-        ).pack(side="right")
+        ttk.Label(
+            quality,
+            text=(
+                "V9 uses exact raster-cell geometry. After Calculate, print-color "
+                "ownership is frozen: no smoothing, contour simplification or gap "
+                "repair is allowed to recolor pixels later."
+            ),
+            wraplength=330,
+        ).pack(fill="x", pady=(0, 6))
 
         self.row_entry(
-            quality, "Geometry Resolution (px)", self.geometry_pixels,
-            "Resolution used only for final geometry. Small source images are upscaled for vectorization "
-            "without recalculating color assignments. 1600 is a good default; use 2400 for very fine logos."
+            quality,
+            "Min. Island Area (mm²)",
+            self.min_area,
+            (
+                "Automatic raster cleanup threshold used only when Calculate is pressed. "
+                "Tiny analysis artifacts may move only to a stable directly adjacent print "
+                "color. Manually painted print pixels are protected."
+            ),
         )
-
-        self.row_entry(
-            quality, "Contour Simplification (mm)", self.smooth,
-            "Reduces the number of points in the final vector contour. "
-            "Higher values make long edges cleaner but can alter fine details and tight curves. "
-            "Typical range: 0.04 to 0.12 mm."
-        )
-        self.row_entry(quality, "Min. Island Area (mm²)", self.min_area, TIP["min_area"])
-
-        crow = ttk.Frame(quality)
-        crow.pack(fill="x", pady=2)
-        self.label_with_tip(crow, "Contour Mode", TIP["contour"]).pack(side="left")
-        contour_combo = ttk.Combobox(
-            crow, textvariable=self.contour_display,
-            values=list(CONTOUR_DISPLAY.keys()), state="readonly", width=20
-        )
-        contour_combo.pack(side="right")
-        contour_combo.bind("<<ComboboxSelected>>", lambda e: self.contour_mode.set(CONTOUR_DISPLAY[self.contour_display.get()]))
-
+        ttk.Label(
+            quality,
+            text=(
+                "Geometry detail now comes directly from Analysis Resolution. "
+                "For finer STL edges, increase Analysis Resolution and run Analyze Colors again."
+            ),
+            wraplength=330,
+        ).pack(fill="x", pady=(4, 6))
         ttk.Button(
-            quality, text="Apply Geometry — Keep Color Assignments",
-            command=self.apply_geometry_settings
-        ).pack(fill="x", pady=(7, 0))
+            quality,
+            text="Recalculate Final Color Map",
+            command=self.apply_geometry_settings,
+        ).pack(fill="x", pady=(2, 0))
 
         analysis_sec = CollapsibleFrame(root, "Color Analysis", expanded=True)
         self.color_analysis_section = analysis_sec
@@ -1164,9 +1114,9 @@ class App(tk.Tk):
                 "neighboring print colors instead of becoming its own group, assign it to AUTO."
             ),
             (
-                "3. Fine-tune — Open the Manual tab and click Calculate first to resolve all AUTO "
-                "pixels. Make any pixel-level corrections you need, then click Calculate again to "
-                "apply those edits to the other previews."
+                "3. Fine-tune — Open the Manual tab, make any pixel-level corrections you need, "
+                "then click Calculate. Calculate resolves AUTO, cleans tiny automatic artifacts and "
+                "freezes one final color map used by every later preview and STL export."
             ),
             (
                 "4. Finish — Review the final geometry in STL Preview. When everything looks right, "
@@ -1352,7 +1302,7 @@ class App(tk.Tk):
         self.manual_bg_swatch.pack(side="left", padx=(5, 12))
         ttk.Label(
             manual_view,
-            text="Edit first → then Calculate   |   Zoom: mouse wheel   |   Pan: middle mouse button"
+            text="Edit → Calculate freezes final colors   |   Manual print strokes are protected   |   Zoom: wheel   |   Pan: middle button"
         ).pack(side="left")
         self.manual_pending_text = tk.StringVar(value="")
         ttk.Label(manual_view, textvariable=self.manual_pending_text).pack(side="right")
@@ -1375,7 +1325,7 @@ class App(tk.Tk):
         # Exact STL preview
         self.stl_scroll = ScrollFrame(self.tab_stl)
         self.stl_scroll.pack(fill="both", expand=True)
-        self.final_preview_status = tk.StringVar(value="STL Preview is generated from the final vector geometry.")
+        self.final_preview_status = tk.StringVar(value="STL Preview uses the frozen final color map with exact raster-cell geometry.")
         ttk.Label(self.stl_scroll.inner, textvariable=self.final_preview_status).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=8)
         self.stl_scroll.bind_mousewheel_recursive(self.stl_scroll.inner)
 
@@ -1407,20 +1357,12 @@ class App(tk.Tk):
         ttk.Entry(row, textvariable=variable, width=width).pack(side="right")
         return row
 
-    def edge_smoothing_mm(self):
-        return {
-            "Off": 0.0,
-            "Light": 0.10,
-            "Medium": 0.22,
-            "Strong": 0.45,
-            # backward compatibility for older saved profiles
-            "Aus": 0.0,
-            "Leicht": 0.10,
-            "Mittel": 0.22,
-            "Stark": 0.45,
-        }.get(self.edge_smoothing.get(), 0.22)
-
     def apply_geometry_settings(self):
+        """V9 geometry has no post-Calculate color processing.
+
+        The only remaining geometry/cleanup control is Min. Island Area, which
+        belongs to Calculate because it changes the final raster color map.
+        """
         if not self.analysis:
             messagebox.showinfo(
                 "No Analysis",
@@ -1431,16 +1373,10 @@ class App(tk.Tk):
             for_export=False, show_errors=True
         ):
             return
-        self.mark_preview_dirty()
-        self.status.set(
-            f"Recalculating geometry: {self.edge_smoothing.get()} "
-            f"({self.edge_smoothing_mm():.2f} mm), {self._safe_var_int(self.geometry_pixels, 0)} px. "
-            "Color assignments are preserved."
-        )
-        self.save_settings()
 
-        # Bearbeiten/Manuell zeigen absichtlich die Rasterzuordnung.
-        # Die Geometrieänderung ist im STL-Tab sichtbar.
+        if not self.calculate_manual_result():
+            return
+        self.save_settings()
         self.notebook.select(self.tab_stl)
         self.after(50, lambda: self.start_final_preview(force=True))
 
@@ -1461,14 +1397,18 @@ class App(tk.Tk):
     def clear_analysis_state(self):
         """Clear all result state when a different source image is selected."""
         self.analysis = None
-        self._analysis_params_used = None
         self.color_rows = []
         self._highlighted = None
 
         self.manual_label_img = None
         self.manual_background_mask = None
+        self.manual_locked_mask = None
         self.committed_manual_label_img = None
         self.committed_manual_background_mask = None
+        self.committed_manual_locked_mask = None
+        self.committed_final_group_map = None
+        self.committed_group_defs = None
+        self.committed_finalize_stats = None
         self.manual_undo.clear()
         self.set_manual_pending(False)
 
@@ -1491,7 +1431,7 @@ class App(tk.Tk):
                 child.destroy()
         if hasattr(self, "final_preview_status"):
             self.final_preview_status.set(
-                "STL Preview is generated from the final vector geometry."
+                "STL Preview uses the frozen final color map with exact raster-cell geometry."
             )
         if hasattr(self, "deck_preview"):
             self.deck_preview.configure(image="", text="Analyze colors first.")
@@ -1722,7 +1662,7 @@ class App(tk.Tk):
             detail = traceback.format_exc()
             if params.get("out_dir"):
                 try:
-                    log_path = params["out_dir"] / "logo_inlay_error.log"
+                    log_path = params["out_dir"] / "logo_to_stl_error.log"
                     log_path.parent.mkdir(parents=True, exist_ok=True)
                     log_path.write_text(detail, encoding="utf-8")
                 except Exception:
@@ -1734,17 +1674,6 @@ class App(tk.Tk):
     def _finish_analysis_success(self, result, params):
         self.analysis_busy = False
         self.analysis = result
-        self._analysis_params_used = {
-            key: params[key]
-            for key in (
-                "working_pixels",
-                "detect_colors",
-                "background_mode",
-                "white_threshold",
-                "auto_merge",
-                "merge_distance",
-            )
-        }
         self._analysis_auto_merge_used = bool(params["auto_merge"])
         self.render_colors()
         # The Final Preview may still contain the placeholder written when a
@@ -1757,7 +1686,7 @@ class App(tk.Tk):
         messagebox.showerror(
             "Color Analysis Error",
             f"{error_text}\n\n"
-            "See logo_inlay_error.log in the output folder for details."
+            "See logo_to_stl_error.log in the output folder for details."
         )
         self.status.set("Color analysis failed.")
 
@@ -1845,7 +1774,9 @@ class App(tk.Tk):
 
             def changed(*args, self=self, g=group, lbl=group_label):
                 lbl.set(f"→ {display_group_name(g.get())}")
-                self.mark_preview_dirty()
+                # A global group assignment changes the meaning of cluster IDs.
+                # Discard the old frozen V9 map and require Calculate again.
+                self.invalidate_final_color_map(mark_pending=True)
                 self.update_group_preview()
                 self._refresh_logo_aspect_ratio(sync_locked=True)
 
@@ -1869,8 +1800,13 @@ class App(tk.Tk):
 
         self.manual_label_img = self.analysis["label_img"].copy()
         self.manual_background_mask = np.zeros_like(self.manual_label_img, dtype=bool)
+        self.manual_locked_mask = np.zeros_like(self.manual_label_img, dtype=bool)
         self.committed_manual_label_img = self.manual_label_img.copy()
         self.committed_manual_background_mask = self.manual_background_mask.copy()
+        self.committed_manual_locked_mask = self.manual_locked_mask.copy()
+        self.committed_final_group_map = None
+        self.committed_group_defs = None
+        self.committed_finalize_stats = None
         self.manual_changes_pending = False
         self.manual_undo.clear()
         self.set_manual_pending(False)
@@ -1879,7 +1815,13 @@ class App(tk.Tk):
         self.manual_pan_y = 0.0
         self.refresh_manual_targets()
 
-        self.status.set("Colors detected. Assign groups, then use Manual for fine adjustments if needed.")
+        # Build an initial frozen result from the default group assignments.
+        # This is silent because there are no Manual changes yet.
+        self.calculate_manual_result(silent=True)
+        self.status.set(
+            "Colors detected. Assign groups, then use Manual for fine adjustments if needed. "
+            "After Calculate, the final color map is frozen for Preview and STL export."
+        )
         self.update_group_status()
         self.update_group_preview()
         self.update_manual_preview()
@@ -2018,6 +1960,25 @@ class App(tk.Tk):
             return np.zeros_like(self.analysis["label_img"], dtype=bool)
         return None
 
+    def get_effective_final_group_map(self):
+        """Return the frozen print-group map created by Calculate."""
+        return self.committed_final_group_map
+
+    def invalidate_final_color_map(self, mark_pending=True):
+        """Invalidate the frozen result after Edit/grouping changes.
+
+        Manual brush edits keep the previous committed result available while
+        the draft is pending. Global group assignment changes are different:
+        the old final map describes a different grouping and is therefore
+        discarded until Calculate is pressed again.
+        """
+        self.committed_final_group_map = None
+        self.committed_group_defs = None
+        self.committed_finalize_stats = None
+        self.mark_preview_dirty()
+        if mark_pending:
+            self.set_manual_pending(True)
+
     def set_manual_pending(self, pending=True):
         self.manual_changes_pending = bool(pending)
         if hasattr(self, "manual_pending_text"):
@@ -2034,7 +1995,7 @@ class App(tk.Tk):
     def commit_manual_edit(self, refresh_other_tabs=False):
         """Keep the manual draft local until the user presses Calculate.
 
-        V8.0: this method deliberately does not rebuild the Manual bitmap.
+        This method deliberately does not rebuild the Manual bitmap.
         Brush/Line/Fill already update their own visible draft. Calculate is
         still the only action that publishes Manual changes to other tabs.
         """
@@ -2145,16 +2106,23 @@ class App(tk.Tk):
             return
         self.manual_undo.append((
             self.manual_label_img.copy(),
-            self.manual_background_mask.copy() if self.manual_background_mask is not None else None
+            self.manual_background_mask.copy() if self.manual_background_mask is not None else None,
+            self.manual_locked_mask.copy() if self.manual_locked_mask is not None else None,
         ))
         self.manual_undo = self.manual_undo[-6:]
 
     def manual_undo_once(self):
         if not self.manual_undo:
             return
-        labels, bg = self.manual_undo.pop()
+        entry = self.manual_undo.pop()
+        if len(entry) == 3:
+            labels, bg, locked = entry
+        else:  # compatibility with an in-memory undo entry from older code
+            labels, bg = entry
+            locked = np.zeros_like(labels, dtype=bool)
         self.manual_label_img = labels
         self.manual_background_mask = bg
+        self.manual_locked_mask = locked
         self.set_manual_pending(True)
         self.update_manual_preview()
 
@@ -2178,27 +2146,37 @@ class App(tk.Tk):
                 self.manual_label_img, dtype=bool
             )
 
-        self.set_manual_pending(False)
+        if self.committed_manual_locked_mask is not None:
+            self.manual_locked_mask = self.committed_manual_locked_mask.copy()
+        else:
+            self.manual_locked_mask = np.zeros_like(
+                self.manual_label_img, dtype=bool
+            )
+
+        self.set_manual_pending(self.committed_final_group_map is None)
         self.update_manual_preview()
 
-    def calculate_manual_result(self):
-        """Process the complete manual draft and publish it to the whole app.
 
-        Until this button is pressed, Brush/Line/Fill/Undo/Reset remain local
-        to the Manual tab. On press:
-          1. all current manual edits are taken,
-          2. all AUTO pixels are resolved,
-          3. the resolved result replaces the manual draft,
-          4. the same result becomes the committed state for every other tab
-             and for STL export.
+    def calculate_manual_result(self, silent=False):
+        """Finalize the Manual draft into ONE immutable print-group map.
+
+        V9 architecture:
+          1. cluster/group assignments + Manual edits are converted to print IDs;
+          2. tiny automatic artifacts are cleaned once in raster space;
+          3. AUTO is resolved using strict real-edge adjacency;
+          4. the result is frozen as `committed_final_group_map`;
+          5. STL Preview / Final Preview / Export never reassign a color again.
+
+        Manually painted print pixels are protected by `manual_locked_mask` and
+        are never removed by the automatic tiny-island cleanup.
         """
         if self.manual_label_img is None:
             return False
 
-        self.status.set("Calculating manual edits and AUTO regions…")
+        if not silent:
+            self.status.set("Calculating final color map…")
 
         try:
-            import cv2
             draft = self.manual_label_img.copy()
             plan = self.get_color_plan()
 
@@ -2211,65 +2189,26 @@ class App(tk.Tk):
                     "name": "auto verteilen",
                 }]
 
-            # V8.2: remove tiny already-assigned color specks BEFORE AUTO.
-            # This is the missing raster-level cleanup: the result is visible
-            # directly in Manual after Calculate, not only later in STL Preview.
-            min_area_mm2 = self._safe_var_float(self.min_area, 0.08)
+            min_area_mm2 = self._safe_var_float(self.min_area, 0.05)
             target_width_mm = self._safe_var_float(self.target_w, 70.0)
             target_height_mm = self._safe_var_float(self.target_h, 45.0)
             keep_aspect = bool(self.keep_aspect.get())
 
-            pre_cleaned, pre_stats = cleanup_small_color_islands(
+            result = finalize_color_map(
                 label_img=draft,
                 color_plan=plan,
+                manual_background_mask=self.manual_background_mask,
+                manual_locked_mask=self.manual_locked_mask,
                 min_area_mm2=min_area_mm2,
                 target_width_mm=target_width_mm,
                 target_height_mm=target_height_mm,
                 keep_aspect=keep_aspect,
-                background_mask=self.manual_background_mask,
             )
 
-            # Resolve AUTO only once, at calculation time, after obvious tiny
-            # wrong-color islands have been removed as possible AUTO seeds.
-            resolved, _ = redistribute_auto_groups(pre_cleaned, plan)
-
-            # Clean once more after AUTO so the committed Manual raster itself
-            # is spatially clean before any STL/vector processing starts.
-            resolved, post_stats = cleanup_small_color_islands(
-                label_img=resolved,
-                color_plan=plan,
-                min_area_mm2=min_area_mm2,
-                target_width_mm=target_width_mm,
-                target_height_mm=target_height_mm,
-                keep_aspect=keep_aspect,
-                background_mask=self.manual_background_mask,
-            )
-
-            auto_ids = {
-                int(item["cluster"])
-                for item in plan
-                if item.get("enabled", True)
-                and str(item.get("group", "")).strip().lower() == "auto verteilen"
-            }
-            if auto_ids and np.any(np.isin(resolved, list(auto_ids))):
-                unresolved_mask = np.isin(resolved, list(auto_ids))
-                count, _ = cv2.connectedComponents(
-                    unresolved_mask.astype(np.uint8), connectivity=4
-                )
-                components = max(0, int(count) - 1)
-                pixels = int(np.sum(unresolved_mask))
-                raise ValueError(
-                    "AUTO could not resolve "
-                    f"{components} isolated region(s) / {pixels} pixel(s). "
-                    "AUTO now uses only print colors that share a real pixel edge "
-                    "with the AUTO region. Diagonal or non-touching colors are "
-                    "never guessed. Assign the isolated region manually or connect "
-                    "it to the intended neighboring print color."
-                )
-
-            # The Manual tab must also display/use the calculated result afterwards.
-            self.manual_label_img = resolved.copy()
-            self.committed_manual_label_img = resolved.copy()
+            # Manual stays editable through representative source cluster IDs,
+            # while every final/output stage uses only final_group_map.
+            self.manual_label_img = result["resolved_label_img"].copy()
+            self.committed_manual_label_img = self.manual_label_img.copy()
 
             if self.manual_background_mask is not None:
                 self.committed_manual_background_mask = (
@@ -2278,35 +2217,48 @@ class App(tk.Tk):
             else:
                 self.committed_manual_background_mask = None
 
+            if self.manual_locked_mask is not None:
+                self.committed_manual_locked_mask = self.manual_locked_mask.copy()
+            else:
+                self.committed_manual_locked_mask = np.zeros_like(
+                    self.manual_label_img, dtype=bool
+                )
+
+            frozen_map = result["final_group_map"].copy()
+            # Make the committed source-of-truth map physically read-only in
+            # memory. Preview/export workers receive copies; no later UI or
+            # geometry path can accidentally recolor this committed state.
+            frozen_map.setflags(write=False)
+            self.committed_final_group_map = frozen_map
+            self.committed_group_defs = [dict(item) for item in result["group_defs"]]
+            self.committed_finalize_stats = dict(result.get("stats", {}))
+
             self.set_manual_pending(False)
             self._refresh_logo_aspect_ratio(sync_locked=True)
             self.mark_preview_dirty()
 
-            # Update all dependent views only now.
             self.update_manual_preview()
             self.update_group_preview()
             self.update_deck_preview()
 
-            cleaned_pixels = int(
-                pre_stats.get("changed_pixels", 0)
-                + post_stats.get("changed_pixels", 0)
-            )
-            cleaned_components = int(
-                pre_stats.get("changed_components", 0)
-                + post_stats.get("changed_components", 0)
-            )
+            stats = result.get("stats", {})
+            cleaned_pixels = int(stats.get("cleanup_pixels", 0))
+            cleaned_components = int(stats.get("cleanup_components", 0))
+            auto_pixels = int(stats.get("auto_resolved_pixels", 0))
 
-            if cleaned_pixels > 0:
+            if not silent:
+                details = []
+                if auto_pixels:
+                    details.append(f"AUTO: {auto_pixels} pixel(s)")
+                if cleaned_pixels:
+                    details.append(
+                        f"cleanup: {cleaned_pixels} pixel(s) / "
+                        f"{cleaned_components} tiny region(s)"
+                    )
+                suffix = " — " + ", ".join(details) if details else ""
                 self.status.set(
-                    "Calculation complete. AUTO was resolved and "
-                    f"{cleaned_pixels} stray pixel(s) in approximately "
-                    f"{cleaned_components} tiny region(s) were reassigned to "
-                    "their strongest directly adjacent print color."
-                )
-            else:
-                self.status.set(
-                    "Calculation complete. Manual edits and AUTO assignments were "
-                    "applied to all previews."
+                    "Calculation complete. Final color map frozen for all previews "
+                    f"and STL export{suffix}."
                 )
 
             try:
@@ -2317,9 +2269,12 @@ class App(tk.Tk):
 
             return True
 
-        except Exception as e:
-            messagebox.showerror("Calculate", str(e))
-            self.status.set("Calculation failed.")
+        except Exception as exc:
+            if not silent:
+                messagebox.showerror("Calculate", str(exc))
+                self.status.set("Calculation failed.")
+            else:
+                self.status.set(f"Initial calculation failed: {exc}")
             return False
 
     def manual_source_xy(self, event):
@@ -2502,6 +2457,9 @@ class App(tk.Tk):
         h, w = local_mask.shape
         labels_roi = self.manual_label_img[y0:y0 + h, x0:x0 + w]
         bg_roi = self.manual_background_mask[y0:y0 + h, x0:x0 + w]
+        if self.manual_locked_mask is None:
+            self.manual_locked_mask = np.zeros_like(self.manual_label_img, dtype=bool)
+        lock_roi = self.manual_locked_mask[y0:y0 + h, x0:x0 + w]
 
         target = self.manual_target.get().strip()
         if not target:
@@ -2509,11 +2467,14 @@ class App(tk.Tk):
 
         if target == "zu Hintergrund":
             bg_roi[local_mask] = True
+            lock_roi[local_mask] = True
             return
 
         if target == "auto verteilen":
             labels_roi[local_mask] = MANUAL_AUTO_LABEL
             bg_roi[local_mask] = False
+            # AUTO is intentionally not locked to a final print color.
+            lock_roi[local_mask] = False
             return
 
         cluster = self.cluster_for_group(target)
@@ -2521,13 +2482,16 @@ class App(tk.Tk):
             return
         labels_roi[local_mask] = cluster
         bg_roi[local_mask] = False
+        # A manually painted print color is authoritative and may not be
+        # removed later by automatic tiny-island cleanup.
+        lock_roi[local_mask] = True
 
     def manual_apply_brush_segment(self, start_pos, end_pos):
         """Paint one continuous brush segment using only a small local ROI.
 
         Earlier versions allocated an image-sized mask for every mouse event.
         On large analysis images that made the brush stutter even though no
-        Calculate/STL processing was running. V8.0 allocates only the bounding
+        Calculate/STL processing was running. The editor allocates only the bounding
         rectangle around the current stroke segment.
         """
         import cv2
@@ -2617,21 +2581,26 @@ class App(tk.Tk):
     def manual_apply_mask(self, mask):
         if self.manual_label_img is None:
             return
+        if self.manual_locked_mask is None:
+            self.manual_locked_mask = np.zeros_like(self.manual_label_img, dtype=bool)
         target = self.manual_target.get().strip()
         if not target:
             return
         if target == "zu Hintergrund":
             self.manual_background_mask[mask] = True
+            self.manual_locked_mask[mask] = True
             return
         if target == "auto verteilen":
             self.manual_label_img[mask] = MANUAL_AUTO_LABEL
             self.manual_background_mask[mask] = False
+            self.manual_locked_mask[mask] = False
             return
         cluster = self.cluster_for_group(target)
         if cluster is None:
             return
         self.manual_label_img[mask] = cluster
         self.manual_background_mask[mask] = False
+        self.manual_locked_mask[mask] = True
 
     def manual_paint(self, pos, refresh=True):
         """Compatibility helper for one brush dab."""
@@ -2650,7 +2619,7 @@ class App(tk.Tk):
         else:
             source_mask = ((self.manual_label_img == source_label) & (~self.manual_background_mask)).astype(np.uint8)
 
-        num, labels = cv2.connectedComponents(source_mask, 8)
+        num, labels = cv2.connectedComponents(source_mask, connectivity=8)
         component = int(labels[y, x])
         if component <= 0:
             return
@@ -2817,25 +2786,6 @@ class App(tk.Tk):
         elif tab_text == "Final Preview":
             self.update_deck_preview()
 
-    def _analysis_settings_for_processing(self):
-        """Return the settings that created the current label map.
-
-        Changes in the Color Analysis controls only take effect after the user
-        clicks Analyze Colors again. Preview/export therefore use the settings
-        of the current analysis, preventing shape/cluster mismatches.
-        """
-        used = getattr(self, "_analysis_params_used", None)
-        if used:
-            return dict(used)
-        return {
-            "working_pixels": self._safe_var_int(self.working_pixels),
-            "detect_colors": self._safe_var_int(self.detect_colors),
-            "background_mode": self.background.get(),
-            "white_threshold": self._safe_var_int(self.white_threshold),
-            "auto_merge": bool(self.auto_merge.get()),
-            "merge_distance": self._safe_var_float(self.merge_distance),
-        }
-
     def start_final_preview(self, force=False):
         if not self.analysis or self.final_preview_busy:
             return
@@ -2847,10 +2797,17 @@ class App(tk.Tk):
 
         if self.manual_changes_pending:
             self.final_preview_status.set(
-                "Manual contains changes that have not been calculated yet. "
-                "Open Manual and click Calculate first."
+                "Manual / grouping contains changes that have not been calculated yet. "
+                "Click Calculate first."
             )
             return
+
+        if self.committed_final_group_map is None:
+            if not self.calculate_manual_result(silent=True):
+                self.final_preview_status.set(
+                    "No final color map is available. Click Calculate first."
+                )
+                return
 
         if not self.final_preview_dirty and not force:
             return
@@ -2868,67 +2825,34 @@ class App(tk.Tk):
             color_map = {}
             for item in color_plan:
                 group = str(item["group"]).strip()
-                safe = re.sub(
-                    r"[^A-Za-z0-9._-]+", "_", group
-                ).strip("_") or "group"
-                color_map[safe] = self.group_preview_rgb(
-                    group, item["rgb"]
-                )
+                if not item.get("enabled", True):
+                    continue
+                if group.lower() in ("zu hintergrund", "auto verteilen"):
+                    continue
+                rgb = self.group_preview_rgb(group, item.get("rgb", [160, 160, 160]))
+                color_map[group] = rgb
+                safe = re.sub(r"[^A-Za-z0-9._-]+", "_", group).strip("_") or "group"
+                color_map[safe] = rgb
 
-            analysis_used = self._analysis_settings_for_processing()
             params = {
-                "image_path": Path(self.image_path.get()),
-                "color_plan": color_plan,
+                "final_group_map": self.committed_final_group_map.copy(),
+                "group_defs": [dict(item) for item in (self.committed_group_defs or [])],
                 "manual_width_mm": self._safe_var_float(self.target_w),
                 "manual_height_mm": self._safe_var_float(self.target_h),
                 "keep_aspect": bool(self.keep_aspect.get()),
-                "detect_colors": int(analysis_used["detect_colors"]),
-                "background_mode": analysis_used["background_mode"],
-                "white_threshold": int(analysis_used["white_threshold"]),
-                "working_pixels": int(analysis_used["working_pixels"]),
-                "geometry_pixels": self._safe_var_int(self.geometry_pixels),
-                "min_area_mm2": self._safe_var_float(self.min_area),
-                "simplify_mm": self._safe_var_float(self.smooth),
-                "close_strength": 0,
-                "auto_merge": bool(analysis_used["auto_merge"]),
-                "merge_distance": float(analysis_used["merge_distance"]),
-                "contour_mode": self.contour_mode.get(),
-                "edge_smoothing_mm": self.edge_smoothing_mm(),
-                "label_override": (
-                    self.get_effective_label_img().copy()
-                    if self.get_effective_label_img() is not None
-                    else None
-                ),
-                "manual_background_mask": (
-                    self.get_effective_background_mask().copy()
-                    if self.get_effective_background_mask() is not None
-                    else None
-                ),
                 "group_colors": color_map,
                 "_ui_color_plan": [
-                    {
-                        **item,
-                        "rgb": list(item.get("rgb", [160, 160, 160])),
-                    }
+                    {**item, "rgb": list(item.get("rgb", [160, 160, 160]))}
                     for item in color_plan
                 ],
-                "_ui_geometry_settings": {
-                    "smoothing_name": self.edge_smoothing.get(),
-                    "smoothing_mm": self.edge_smoothing_mm(),
-                    "geometry_pixels": self._safe_var_int(self.geometry_pixels),
-                    "simplify_mm": self._safe_var_float(self.smooth),
-                    "contour_mode": self.contour_display.get(),
-                },
             }
         except Exception as exc:
-            self.final_preview_status.set(
-                f"Preview settings error: {exc}"
-            )
+            self.final_preview_status.set(f"Preview settings error: {exc}")
             return
 
         self.final_preview_busy = True
         self.final_preview_status.set(
-            "Calculating final vector geometry…"
+            "Building exact STL geometry from the frozen final color map…"
         )
         threading.Thread(
             target=self.final_preview_worker,
@@ -2939,36 +2863,17 @@ class App(tk.Tk):
     def final_preview_worker(self, params):
         try:
             data = build_partition_preview(
-                image_path=params["image_path"],
-                color_plan=params["color_plan"],
+                final_group_map=params["final_group_map"],
+                group_defs=params["group_defs"],
                 manual_width_mm=params["manual_width_mm"],
                 manual_height_mm=params["manual_height_mm"],
                 keep_aspect=params["keep_aspect"],
-                detect_colors=params["detect_colors"],
-                background_mode=params["background_mode"],
-                white_threshold=params["white_threshold"],
-                working_pixels=params["working_pixels"],
-                geometry_pixels=params["geometry_pixels"],
-                min_area_mm2=params["min_area_mm2"],
-                simplify_mm=params["simplify_mm"],
-                close_strength=params["close_strength"],
-                auto_merge=params["auto_merge"],
-                merge_distance=params["merge_distance"],
-                contour_mode=params["contour_mode"],
-                edge_smoothing_mm=params["edge_smoothing_mm"],
-                label_override=params["label_override"],
-                manual_background_mask=params["manual_background_mask"],
                 group_colors=params["group_colors"],
             )
-            data["_ui_geometry_settings"] = params[
-                "_ui_geometry_settings"
-            ]
             data["_ui_color_plan"] = params["_ui_color_plan"]
             self._post_ui(self.render_final_preview, data)
         except Exception as exc:
-            self._post_ui(
-                self._set_final_preview_error, str(exc)
-            )
+            self._post_ui(self._set_final_preview_error, str(exc))
         finally:
             self._post_ui(self.finish_final_preview)
 
@@ -2985,14 +2890,13 @@ class App(tk.Tk):
         self._apply_final_geometry_size_to_ui(data)
 
         rgba = data["rgba"]
-        settings = data.get("_ui_geometry_settings", {})
         final_w = float(data.get("final_width_mm", 0.0))
         final_h = float(data.get("final_height_mm", 0.0))
+        source_w = int(data.get("source_width_px", rgba.shape[1]))
+        source_h = int(data.get("source_height_px", rgba.shape[0]))
         title = (
-            f"Final Geometry — {final_w:.2f} × {final_h:.2f} mm — "
-            f"{settings.get('smoothing_name', '?')} / "
-            f"{settings.get('smoothing_mm', 0):.2f} mm / "
-            f"{settings.get('geometry_pixels', '?')} px"
+            f"Exact Raster Geometry — {final_w:.2f} × {final_h:.2f} mm — "
+            f"source {source_w} × {source_h} px"
         )
         total = ttk.LabelFrame(
             self.stl_scroll.inner, text=title, padding=8
@@ -3024,7 +2928,7 @@ class App(tk.Tk):
             total,
             comp,
             f"Final STL footprint: {final_w:.3f} × {final_h:.3f} mm\n"
-            "This preview uses the same vector partition as the STL export.\n"
+            "This preview uses the same frozen final color map as the STL export.\n"
             + partition_status,
             max_size=(520, 340)
         )
@@ -3136,38 +3040,22 @@ class App(tk.Tk):
         except Exception:
             return fallback
 
-    def logo_array_on_background(self, label_img, background_rgb):
-        """Create deck preview. Unresolved AUTO remains grey until calculated."""
-        h, w = label_img.shape
-        arr = np.zeros((h, w, 3), dtype=np.uint8)
+    def final_map_array_on_background(self, final_group_map, background_rgb):
+        """Render the frozen final print-group map without inventing new colors."""
+        group_map = np.asarray(final_group_map)
+        h, w = group_map.shape
+        arr = np.empty((h, w, 3), dtype=np.uint8)
         arr[:, :] = np.asarray(background_rgb, dtype=np.uint8)
 
-        for item in self.get_color_plan():
-            group = str(item.get("group", "")).strip()
-            key = group.lower()
-            if not item.get("enabled", True) or key == "zu hintergrund":
-                continue
-
-            if key == "auto verteilen":
-                rgb = [150, 150, 150]
-            else:
-                rgb = self.group_preview_rgb(
-                    group, item.get("rgb", [160, 160, 160])
-                )
-            arr[label_img == int(item["cluster"])] = np.asarray(rgb, dtype=np.uint8)
-
-        committed_bg = self.get_effective_background_mask()
-        if committed_bg is not None:
-            arr[committed_bg] = np.asarray(background_rgb, dtype=np.uint8)
+        for item in self.committed_group_defs or []:
+            gid = int(item["id"])
+            group = str(item.get("name", ""))
+            rgb = self.group_preview_rgb(group, item.get("rgb", [160, 160, 160]))
+            arr[group_map == gid] = np.asarray(rgb, dtype=np.uint8)
         return arr
 
     def update_deck_preview(self):
-        """Render the current calculated logo on the target surface.
-
-        This preview is deliberately independent of STL vector calculation, but
-        it uses the committed Manual state. It is also tolerant of decimal-comma
-        input and logos that are larger than the target surface.
-        """
+        """Render the frozen final color map on the target surface."""
         if not hasattr(self, "deck_preview"):
             return
 
@@ -3176,9 +3064,12 @@ class App(tk.Tk):
             self.deckel_photo = None
             return
 
-        label_img = self.get_effective_label_img()
-        if label_img is None:
-            self.deck_preview.configure(image="", text="No calculated logo data available.")
+        final_map = self.get_effective_final_group_map()
+        if final_map is None:
+            self.deck_preview.configure(
+                image="",
+                text="Click Calculate to create the final color map.",
+            )
             self.deckel_photo = None
             return
 
@@ -3204,11 +3095,9 @@ class App(tk.Tk):
             return
 
         try:
-            deck_rgb = self.parse_hex_color(self.deck_color.get())
-            logo_rgb = self.logo_array_on_background(label_img, deck_rgb)
-
-            active = self._current_printable_mask(label_img)
-            if active is None or not np.any(active):
+            final_map = np.asarray(final_map, dtype=np.int16)
+            active = final_map >= 0
+            if not np.any(active):
                 self.deck_preview.configure(
                     image="",
                     text="No printable color area is available for the Final Preview.",
@@ -3216,19 +3105,16 @@ class App(tk.Tk):
                 self.deckel_photo = None
                 return
 
-            # Crop away source-image padding while preserving true transparent /
-            # BG holes through a separate alpha mask.
+            deck_rgb = self.parse_hex_color(self.deck_color.get())
+            logo_rgb = self.final_map_array_on_background(final_map, deck_rgb)
+
             ys, xs = np.nonzero(active)
             x0c, x1c = int(xs.min()), int(xs.max()) + 1
             y0c, y1c = int(ys.min()), int(ys.max()) + 1
             logo_rgb = logo_rgb[y0c:y1c, x0c:x1c]
-            logo_alpha = (active[y0c:y1c, x0c:x1c].astype(np.uint8) * 255)
+            logo_alpha = active[y0c:y1c, x0c:x1c].astype(np.uint8) * 255
 
             canvas_w, canvas_h = 760, 480
-
-            # Fit both the target surface AND a potentially oversized logo into
-            # the preview canvas. This avoids negative/out-of-bounds composite
-            # coordinates while still making oversize immediately visible.
             span_w = max(deck_w, target_w)
             span_h = max(deck_h, target_h)
             scale = min(
@@ -3245,20 +3131,20 @@ class App(tk.Tk):
             bg = np.ones((canvas_h, canvas_w, 3), dtype=np.uint8) * 238
             deck_x = (canvas_w - dw) // 2
             deck_y = (canvas_h - dh) // 2
-            bg[
-                deck_y:deck_y + dh,
-                deck_x:deck_x + dw,
-            ] = np.asarray(deck_rgb, dtype=np.uint8)
+            bg[deck_y:deck_y + dh, deck_x:deck_x + dw] = np.asarray(
+                deck_rgb, dtype=np.uint8
+            )
 
-            # Clear border around the target surface.
             if dh >= 2 and dw >= 2:
                 bg[deck_y:deck_y + 2, deck_x:deck_x + dw] = 80
                 bg[deck_y + dh - 2:deck_y + dh, deck_x:deck_x + dw] = 80
                 bg[deck_y:deck_y + dh, deck_x:deck_x + 2] = 80
                 bg[deck_y:deck_y + dh, deck_x + dw - 2:deck_x + dw] = 80
 
+            # NEAREST is deliberate: Final Preview must never display blended
+            # colors that are not present in the frozen final map.
             logo_img = Image.fromarray(logo_rgb).convert("RGBA").resize(
-                (lw, lh), Image.Resampling.LANCZOS
+                (lw, lh), Image.Resampling.NEAREST
             )
             alpha_img = Image.fromarray(logo_alpha, mode="L").resize(
                 (lw, lh), Image.Resampling.NEAREST
@@ -3274,8 +3160,6 @@ class App(tk.Tk):
             self.deck_preview.configure(image=self.deckel_photo, text="")
 
         except Exception as exc:
-            # Never leave a misleading stale "Analyze colors first." placeholder
-            # when analysis actually exists.
             self.deckel_photo = None
             self.deck_preview.configure(
                 image="",
@@ -3302,12 +3186,16 @@ class App(tk.Tk):
 
         if self.manual_changes_pending:
             ok = messagebox.askyesno(
-                "Manual Changes Not Calculated",
-                "Manual contains changes that have not been calculated yet.\n\n"
+                "Changes Not Calculated",
+                "Manual / grouping contains changes that have not been calculated yet.\n\n"
                 "Calculate them now and then generate the STLs?"
             )
             if not ok:
                 return
+            if not self.calculate_manual_result():
+                return
+
+        if self.committed_final_group_map is None:
             if not self.calculate_manual_result():
                 return
 
@@ -3316,7 +3204,16 @@ class App(tk.Tk):
         ):
             return
 
-        group_count, groups = self.active_groups_count()
+        present_names = []
+        present_ids = set(
+            int(v) for v in np.unique(self.committed_final_group_map)
+            if int(v) >= 0
+        )
+        for item in self.committed_group_defs or []:
+            if int(item["id"]) in present_ids:
+                present_names.append(str(item["name"]))
+
+        group_count = len(present_names)
         if group_count <= 0:
             messagebox.showerror(
                 "No Printable Groups",
@@ -3327,8 +3224,8 @@ class App(tk.Tk):
         if group_count > 4:
             ok = messagebox.askyesno(
                 "Many Color Groups",
-                f"You created {group_count} active print groups:\n"
-                f"{', '.join(display_group_name(g) for g in groups)}\n\n"
+                f"The frozen final map contains {group_count} print groups:\n"
+                f"{', '.join(display_group_name(g) for g in present_names)}\n\n"
                 "A typical AMS handles up to 4 colors at once. Export anyway?"
             )
             if not ok:
@@ -3343,55 +3240,26 @@ class App(tk.Tk):
             return
 
         try:
-            analysis_used = self._analysis_settings_for_processing()
             params = {
                 "image_path": Path(self.image_path.get()),
                 "out_dir": Path(out_text),
                 "project_name": self.project.get(),
-                "color_plan": self.get_color_plan(),
-                "target_mode": "manual",
+                "final_group_map": self.committed_final_group_map.copy(),
+                "group_defs": [dict(item) for item in (self.committed_group_defs or [])],
                 "manual_width_mm": self._safe_var_float(self.target_w),
                 "manual_height_mm": self._safe_var_float(self.target_h),
                 "keep_aspect": bool(self.keep_aspect.get()),
-                "deck_width_mm": self._safe_var_float(self.deckel_w),
-                "deck_height_mm": self._safe_var_float(self.deckel_h),
-                "margin_mm": 0.0,
-                "fit_percent": 100.0,
                 "height_mm": self._safe_var_float(self.height),
                 "cut_depth_mm": self._safe_var_float(self.cut),
                 "clearance_mm": self._safe_var_float(self.clearance),
-                "detect_colors": int(analysis_used["detect_colors"]),
-                "background_mode": analysis_used["background_mode"],
-                "white_threshold": int(analysis_used["white_threshold"]),
-                "working_pixels": int(analysis_used["working_pixels"]),
-                "geometry_pixels": self._safe_var_int(self.geometry_pixels),
-                "min_area_mm2": self._safe_var_float(self.min_area),
-                "simplify_mm": self._safe_var_float(self.smooth),
-                "close_strength": 0,
-                "auto_merge": bool(analysis_used["auto_merge"]),
-                "merge_distance": float(analysis_used["merge_distance"]),
-                "contour_mode": self.contour_mode.get(),
-                "edge_smoothing_mm": self.edge_smoothing_mm(),
                 "center_output": True,
-                "label_override": (
-                    self.get_effective_label_img().copy()
-                    if self.get_effective_label_img() is not None
-                    else None
-                ),
-                "manual_background_mask": (
-                    self.get_effective_background_mask().copy()
-                    if self.get_effective_background_mask() is not None
-                    else None
-                ),
             }
         except Exception as exc:
-            messagebox.showerror(
-                "Invalid Export Setting", str(exc)
-            )
+            messagebox.showerror("Invalid Export Setting", str(exc))
             return
 
         self.generate_busy = True
-        self.status.set("Generating STLs...")
+        self.status.set("Generating exact STLs from the frozen final color map…")
         threading.Thread(
             target=self.generate_worker,
             args=(params,),
@@ -3409,7 +3277,7 @@ class App(tk.Tk):
         except Exception as exc:
             detail = traceback.format_exc()
             try:
-                log_path = params["out_dir"] / "logo_inlay_error.log"
+                log_path = params["out_dir"] / "logo_to_stl_error.log"
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 log_path.write_text(detail, encoding="utf-8")
             except Exception:
@@ -3466,7 +3334,7 @@ class App(tk.Tk):
         messagebox.showerror(
             "Export Error",
             f"{error_text}\n\n"
-            "See logo_inlay_error.log in the output folder for details."
+            "See logo_to_stl_error.log in the output folder for details."
         )
         self.status.set("Export failed.")
 
@@ -3489,26 +3357,19 @@ class App(tk.Tk):
         finally:
             self._size_sync_guard = False
 
-        self.edge_smoothing.set(
-            EDGE_SMOOTHING_MIGRATION.get(
-                self.edge_smoothing.get(),
-                self.edge_smoothing.get()
-            )
-        )
         self.background_display.set(
             BACKGROUND_INTERNAL.get(
                 self.background.get(), "Transparent background"
-            )
-        )
-        self.contour_display.set(
-            CONTOUR_INTERNAL.get(
-                self.contour_mode.get(), "Straight / crisp"
             )
         )
 
         # If aspect lock is part of the profile, keep its requested width and
         # derive Height from the current logo instead of overwriting Width.
         self._refresh_logo_aspect_ratio(sync_locked=True)
+        if self.analysis is not None:
+            # Min. Island Area is part of Calculate in V9, so applying a profile
+            # recalculates the frozen final map once with the new profile values.
+            self.calculate_manual_result(silent=True)
         self.mark_preview_dirty()
         self.update_deck_preview()
         self.status.set(

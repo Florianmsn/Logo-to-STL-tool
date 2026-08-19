@@ -2,11 +2,11 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-title Logo to STL Tool 8.3 EXE Builder
+title Logo to STL Tool 9.0 EXE Builder
 
 echo.
 echo ============================================
-echo   Logo to STL Tool 8.3 - EXE Builder
+echo   Logo to STL Tool 9.0 - EXE Builder
 echo ============================================
 echo.
 
@@ -72,9 +72,9 @@ rem ------------------------------------------------------------
 rem Remove an old EXE first so a failed build can never look
 rem successful just because an older file is still in dist.
 rem ------------------------------------------------------------
-if exist "dist\Logo to STL Tool 8.3.exe" (
+if exist "dist\Logo to STL Tool 9.0.exe" (
     echo Removing old EXE...
-    del /q "dist\Logo to STL Tool 8.3.exe"
+    del /q "dist\Logo to STL Tool 9.0.exe"
 )
 
 echo.
@@ -84,14 +84,14 @@ echo Building EXE...
     --clean ^
     --onefile ^
     --windowed ^
-    --name "Logo to STL Tool 8.3" ^
+    --name "Logo to STL Tool 9.0" ^
     --hidden-import=shapely ^
     --hidden-import=trimesh ^
     logo_inlay_app.py
 
 if errorlevel 1 goto :BUILD_FAILED
 
-if not exist "dist\Logo to STL Tool 8.3.exe" goto :BUILD_FAILED
+if not exist "dist\Logo to STL Tool 9.0.exe" goto :BUILD_FAILED
 
 echo.
 echo ============================================
@@ -99,7 +99,7 @@ echo   BUILD SUCCESSFUL
 echo ============================================
 echo.
 echo Created:
-echo   %~dp0dist\Logo to STL Tool 8.3.exe
+echo   %~dp0dist\Logo to STL Tool 9.0.exe
 echo.
 pause
 exit /b 0
