@@ -10,6 +10,10 @@ import numpy as np
 from PIL import Image
 import shutil
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
+try:
+    from shapely import make_valid as shapely_make_valid
+except Exception:
+    shapely_make_valid = None
 from shapely.ops import unary_union, triangulate
 try:
     from shapely import constrained_delaunay_triangles
@@ -694,6 +698,186 @@ def _polygon_raster_edge_neighbor_counts(
     }
 
 
+def _polygon_raster_inside_counts(
+    polygon: Polygon,
+    group_map: np.ndarray,
+    mm_per_px: float,
+    protected_mask=None,
+):
+    """Count source-of-truth raster colors directly UNDER a vector polygon.
+
+    The polygon is rasterized back onto the cleaned group_map. Pixels marked in
+    protected_mask (BG) are ignored completely.
+    """
+    if polygon is None or polygon.is_empty or polygon.area <= 0 or mm_per_px <= 0:
+        return {}
+
+    h, w = group_map.shape
+    minx, miny, maxx, maxy = polygon.bounds
+
+    x0 = max(0, int(np.floor(minx / mm_per_px)) - 1)
+    x1 = min(w - 1, int(np.ceil(maxx / mm_per_px)) + 1)
+    y0 = max(0, int(np.floor(h - (maxy / mm_per_px))) - 1)
+    y1 = min(h - 1, int(np.ceil(h - (miny / mm_per_px))) + 1)
+
+    if x1 < x0 or y1 < y0:
+        return {}
+
+    local = np.zeros((y1 - y0 + 1, x1 - x0 + 1), dtype=np.uint8)
+
+    def ring_to_pixels(ring):
+        pts = []
+        for x, y in ring.coords:
+            px = int(round(x / mm_per_px)) - x0
+            py = int(round(h - (y / mm_per_px))) - y0
+            pts.append([px, py])
+        return np.asarray(pts, dtype=np.int32)
+
+    try:
+        outer = ring_to_pixels(polygon.exterior)
+        if len(outer) >= 3:
+            cv2.fillPoly(local, [outer], 1)
+        for hole in polygon.interiors:
+            pts = ring_to_pixels(hole)
+            if len(pts) >= 3:
+                cv2.fillPoly(local, [pts], 0)
+    except Exception:
+        return {}
+
+    inside = local.astype(bool)
+    if not np.any(inside):
+        return {}
+
+    labels_roi = group_map[y0:y1 + 1, x0:x1 + 1]
+    valid = inside & (labels_roi >= 0)
+
+    if protected_mask is not None:
+        protected = np.asarray(protected_mask, dtype=bool)
+        if protected.shape == group_map.shape:
+            valid &= ~protected[y0:y1 + 1, x0:x1 + 1]
+
+    values = labels_roi[valid]
+    if values.size == 0:
+        return {}
+
+    ids, counts = np.unique(values.astype(np.int32), return_counts=True)
+    return {
+        int(gid): int(count)
+        for gid, count in zip(ids, counts)
+        if int(count) > 0
+    }
+
+
+def _polygon_expanding_local_ring_counts(
+    polygon: Polygon,
+    group_map: np.ndarray,
+    mm_per_px: float,
+    protected_mask=None,
+    max_radius_px: int = 12,
+):
+    """Find the FIRST local raster ring around a gap containing print colors.
+
+    Search radius grows one source pixel at a time. As soon as any valid color
+    appears, the search stops; therefore a farther color can never beat a closer
+    local one. BG pixels are excluded through protected_mask.
+
+    Returns:
+        (counts, radius_px)
+    """
+    if polygon is None or polygon.is_empty or polygon.area <= 0 or mm_per_px <= 0:
+        return {}, None
+
+    h, w = group_map.shape
+    minx, miny, maxx, maxy = polygon.bounds
+    max_radius_px = max(1, int(max_radius_px))
+
+    pad = max_radius_px + 2
+    x0 = max(0, int(np.floor(minx / mm_per_px)) - pad)
+    x1 = min(w - 1, int(np.ceil(maxx / mm_per_px)) + pad)
+    y0 = max(0, int(np.floor(h - (maxy / mm_per_px))) - pad)
+    y1 = min(h - 1, int(np.ceil(h - (miny / mm_per_px))) + pad)
+
+    if x1 < x0 or y1 < y0:
+        return {}, None
+
+    local = np.zeros((y1 - y0 + 1, x1 - x0 + 1), dtype=np.uint8)
+
+    def ring_to_pixels(ring):
+        pts = []
+        for x, y in ring.coords:
+            px = int(round(x / mm_per_px)) - x0
+            py = int(round(h - (y / mm_per_px))) - y0
+            pts.append([px, py])
+        return np.asarray(pts, dtype=np.int32)
+
+    try:
+        outer = ring_to_pixels(polygon.exterior)
+        if len(outer) >= 3:
+            cv2.fillPoly(local, [outer], 1)
+        for hole in polygon.interiors:
+            pts = ring_to_pixels(hole)
+            if len(pts) >= 3:
+                cv2.fillPoly(local, [pts], 0)
+    except Exception:
+        return {}, None
+
+    inside = local.astype(bool)
+    if not np.any(inside):
+        return {}, None
+
+    labels_roi = group_map[y0:y1 + 1, x0:x1 + 1]
+    protected_roi = None
+    if protected_mask is not None:
+        protected = np.asarray(protected_mask, dtype=bool)
+        if protected.shape == group_map.shape:
+            protected_roi = protected[y0:y1 + 1, x0:x1 + 1]
+
+    previous = inside.copy()
+    cross = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+    for radius in range(1, max_radius_px + 1):
+        dilated = cv2.dilate(
+            previous.astype(np.uint8), cross, iterations=1
+        ).astype(bool)
+        shell = dilated & (~previous)
+        previous = dilated
+
+        valid = shell & (labels_roi >= 0)
+        if protected_roi is not None:
+            valid &= ~protected_roi
+
+        values = labels_roi[valid]
+        if values.size == 0:
+            continue
+
+        ids, counts = np.unique(values.astype(np.int32), return_counts=True)
+        result = {
+            int(gid): int(count)
+            for gid, count in zip(ids, counts)
+            if int(count) > 0
+        }
+        if result:
+            return result, radius
+
+    return {}, None
+
+
+def _best_group_from_counts(counts, names):
+    if not counts:
+        return None
+
+    valid = [
+        (int(count), int(gid), names[int(gid)])
+        for gid, count in counts.items()
+        if 0 <= int(gid) < len(names) and int(count) > 0
+    ]
+    if not valid:
+        return None
+
+    valid.sort(key=lambda item: (-item[0], item[2]))
+    return valid[0][2]
+
+
 def _gap_pixel_vote(gap: Polygon, group_map: np.ndarray, mm_per_px: float):
     """Return the raster group id that locally owns most of a vectorization gap.
 
@@ -757,63 +941,65 @@ def _choose_local_gap_owner(
     partition: dict,
     raw: dict,
     simplify_mm: float,
+    protected_background_mask=None,
 ):
-    """Choose a vector-gap owner from proven physical adjacency only.
+    """Choose an owner for a vectorization gap without ever aborting randomly.
 
-    V8.1 final rules:
-      1. Direct 4-neighbor raster ring: most represented color wins.
-      2. An exact tie may be broken by shared vector-boundary length, but only
-         between those same directly adjacent raster colors.
-      3. If the raster ring cannot represent a sub-pixel gap, a TRUE shared
-         vector boundary may be used.
-      4. Otherwise return None and report the unresolved gap.
+    V8.3 priority:
+      1. direct 4-neighbor raster ring around the gap;
+      2. cleaned raster colors directly UNDER the gap (source of truth);
+      3. first non-empty expanding local raster ring;
+      4. exact shared vector boundary;
+      5. nearest existing vector color as an emergency deterministic fallback.
 
-    No inside-gap vote, distance search, RGB search, near-color search or
-    largest-group fallback remains.
+    BG is excluded from every raster vote. The caller additionally clips every
+    assigned polygon to `total`, which already has BG removed.
+
+    The first three rules are raster-local and majority based. The final nearest
+    geometry rule exists only so a rare contour pathology cannot abort Preview /
+    Export; it is deterministic and uses the physically closest existing piece.
     """
     if gap is None or gap.is_empty or gap.area <= 0:
         return None
 
-    # 1) Strict direct-edge raster neighborhood.
-    raster_counts = _polygon_raster_edge_neighbor_counts(
+    # 1) Direct edge-neighbor majority.
+    direct_counts = _polygon_raster_edge_neighbor_counts(
         gap, group_map, mm_per_px
     )
-    if raster_counts:
-        valid = [
-            (int(count), int(gid), names[int(gid)])
-            for gid, count in raster_counts.items()
-            if 0 <= int(gid) < len(names) and int(count) > 0
-        ]
-        if valid:
-            best_count = max(count for count, _, _ in valid)
-            tied = [
-                (gid, name)
-                for count, gid, name in valid
-                if count == best_count
-            ]
+    if protected_background_mask is not None and direct_counts:
+        # _polygon_raster_edge_neighbor_counts does not know BG; if group_map was
+        # already protected by the caller this is naturally safe.
+        pass
 
-            if len(tied) == 1:
-                return tied[0][1]
+    owner = _best_group_from_counts(direct_counts, names)
+    if owner is not None:
+        return owner
 
-            # Exact tie only. No new candidate can enter here.
-            boundary_scores = []
-            for gid, name in tied:
-                geom = partition.get(name)
-                if geom is None or geom.is_empty:
-                    shared = 0.0
-                else:
-                    try:
-                        shared = float(
-                            gap.boundary.intersection(geom.boundary).length
-                        )
-                    except Exception:
-                        shared = 0.0
-                boundary_scores.append((shared, name))
+    # 2) Source of truth directly under the vector gap.
+    inside_counts = _polygon_raster_inside_counts(
+        gap,
+        group_map,
+        mm_per_px,
+        protected_mask=protected_background_mask,
+    )
+    owner = _best_group_from_counts(inside_counts, names)
+    if owner is not None:
+        return owner
 
-            boundary_scores.sort(key=lambda item: (-item[0], item[1]))
-            return boundary_scores[0][1]
+    # 3) Nearest LOCAL raster shell. Search stops at the first radius with any
+    # print color, then local majority wins.
+    local_counts, _radius = _polygon_expanding_local_ring_counts(
+        gap,
+        group_map,
+        mm_per_px,
+        protected_mask=protected_background_mask,
+        max_radius_px=12,
+    )
+    owner = _best_group_from_counts(local_counts, names)
+    if owner is not None:
+        return owner
 
-    # 2) True shared vector boundary is also proven physical adjacency.
+    # 4) True vector shared boundary.
     exact_contacts = []
     for name in names:
         geom = partition.get(name)
@@ -830,7 +1016,31 @@ def _choose_local_gap_owner(
         exact_contacts.sort(key=lambda item: (-item[0], item[1]))
         return exact_contacts[0][1]
 
-    # 3) No proof of adjacency -> never invent an owner.
+    # 5) Emergency non-aborting fallback. Choose the physically closest
+    # existing color geometry. This path should be extremely rare because steps
+    # 1-3 map back to the cleaned source raster.
+    nearest = []
+    for name in names:
+        geom = partition.get(name)
+        if geom is None or geom.is_empty:
+            geom = raw.get(name)
+        if geom is None or geom.is_empty:
+            continue
+        try:
+            distance = float(gap.distance(geom))
+        except Exception:
+            continue
+        nearest.append((distance, name))
+
+    if nearest:
+        nearest.sort(key=lambda item: (item[0], item[1]))
+        return nearest[0][1]
+
+    # If there is only one active name and geometry is temporarily empty,
+    # assigning to that single print group is still deterministic.
+    if len(names) == 1:
+        return names[0]
+
     return None
 
 
@@ -951,6 +1161,196 @@ def _reassign_tiny_embedded_islands(
     return result
 
 
+def _make_valid_polygonal(geom):
+    """Return only valid polygonal content from an arbitrary Shapely geometry."""
+    if geom is None or geom.is_empty:
+        return MultiPolygon([])
+
+    candidate = geom
+    if not getattr(candidate, "is_valid", False):
+        try:
+            if shapely_make_valid is not None:
+                candidate = shapely_make_valid(candidate)
+            else:
+                candidate = candidate.buffer(0)
+        except Exception:
+            try:
+                candidate = candidate.buffer(0)
+            except Exception:
+                return MultiPolygon([])
+
+    polys = [
+        poly for poly in iter_polygons(candidate)
+        if poly is not None and not poly.is_empty and float(poly.area) > 0
+    ]
+    if not polys:
+        return MultiPolygon([])
+
+    try:
+        merged = unary_union(polys)
+    except Exception:
+        # Iterative union is slower but more tolerant for rare pathological
+        # collections produced by aggressive contour smoothing.
+        merged = polys[0]
+        for poly in polys[1:]:
+            try:
+                merged = merged.union(poly)
+            except Exception:
+                merged = merged.buffer(0).union(poly.buffer(0))
+
+    if not getattr(merged, "is_valid", False):
+        try:
+            if shapely_make_valid is not None:
+                merged = shapely_make_valid(merged)
+            else:
+                merged = merged.buffer(0)
+        except Exception:
+            merged = merged.buffer(0)
+
+    final_polys = [
+        poly for poly in iter_polygons(merged)
+        if poly is not None and not poly.is_empty and float(poly.area) > 0
+    ]
+    if not final_polys:
+        return MultiPolygon([])
+
+    if len(final_polys) == 1:
+        return final_polys[0]
+
+    try:
+        return MultiPolygon(final_polys)
+    except Exception:
+        return unary_union(final_polys).buffer(0)
+
+
+def _normalize_exact_partition_geometry(
+    partition: dict,
+    total,
+    names: list[str],
+    group_map: np.ndarray,
+    mm_per_px: float,
+    raw: dict,
+    simplify_mm: float,
+    protected_background_mask=None,
+):
+    """Repair polygon validity and rebuild a non-overlapping exact partition.
+
+    This is the final V8.3 safety stage after gap and tiny-island processing.
+    All color pieces are clipped to `total`; `total` already has BG removed.
+    """
+    total = _make_valid_polygonal(total)
+    if total.is_empty:
+        return {}, total
+
+    repaired = {}
+    for name in names:
+        geom = partition.get(name)
+        if geom is None or geom.is_empty:
+            continue
+        geom = _make_valid_polygonal(geom)
+        if geom.is_empty:
+            continue
+        try:
+            geom = geom.intersection(total)
+        except Exception:
+            geom = _make_valid_polygonal(geom).intersection(total)
+        geom = _make_valid_polygonal(geom)
+        if not geom.is_empty:
+            repaired[name] = geom
+
+    if not repaired:
+        return {}, total
+
+    # Rebuild overlap-free, preserving small/detail regions first.
+    ordered = sorted(
+        repaired.keys(),
+        key=lambda n: float(repaired[n].area)
+    )
+    remaining = total
+    exact = {}
+
+    for name in ordered:
+        try:
+            piece = repaired[name].intersection(remaining)
+        except Exception:
+            piece = _make_valid_polygonal(repaired[name]).intersection(
+                _make_valid_polygonal(remaining)
+            )
+        piece = _make_valid_polygonal(piece)
+        if piece.is_empty:
+            continue
+        exact[name] = piece
+
+        try:
+            remaining = remaining.difference(piece)
+        except Exception:
+            remaining = _make_valid_polygonal(remaining).difference(piece)
+        remaining = _make_valid_polygonal(remaining)
+
+    # Refill any area lost during validity repair using the same source-of-truth
+    # owner logic. Never abort.
+    gaps = [
+        g for g in iter_polygons(remaining)
+        if g is not None and not g.is_empty and float(g.area) > 1e-12
+    ]
+
+    for gap in gaps:
+        owner = _choose_local_gap_owner(
+            gap=gap,
+            names=names,
+            group_map=group_map,
+            mm_per_px=mm_per_px,
+            partition=exact,
+            raw=raw,
+            simplify_mm=simplify_mm,
+            protected_background_mask=protected_background_mask,
+        )
+
+        if owner is None:
+            # Deterministic nearest existing geometry. This should only occur
+            # after pathological validity repair.
+            nearest = []
+            for name in names:
+                geom = exact.get(name)
+                if geom is None or geom.is_empty:
+                    continue
+                try:
+                    nearest.append((float(gap.distance(geom)), name))
+                except Exception:
+                    pass
+            if nearest:
+                nearest.sort(key=lambda item: (item[0], item[1]))
+                owner = nearest[0][1]
+
+        if owner is None:
+            continue
+
+        safe_gap = _make_valid_polygonal(gap.intersection(total))
+        if safe_gap.is_empty:
+            continue
+
+        existing = exact.get(owner)
+        if existing is None or existing.is_empty:
+            exact[owner] = safe_gap
+        else:
+            exact[owner] = _make_valid_polygonal(
+                unary_union([existing, safe_gap]).intersection(total)
+            )
+
+    # Final clip/validity pass. Since every color is inside total, protected BG
+    # remains impossible to refill.
+    result = {}
+    for name in names:
+        geom = exact.get(name)
+        if geom is None or geom.is_empty:
+            continue
+        geom = _make_valid_polygonal(geom.intersection(total))
+        if not geom.is_empty:
+            result[name] = geom
+
+    return result, total
+
+
 def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
                          min_area_px: int, min_area_mm2: float,
                          simplify_mm: float, close_strength: int,
@@ -977,6 +1377,16 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
     if not np.any(active_mask):
         return {}, MultiPolygon([])
 
+    # Protected BG is removed from BOTH geometry and all later raster voting.
+    # Use the same smoothed BG mask that is subtracted from `total`.
+    protected_bg_mask = np.zeros_like(active_mask, dtype=bool)
+    if explicit_background_mask is not None and np.any(explicit_background_mask):
+        protected_bg_mask = _smooth_binary_mask(
+            explicit_background_mask, edge_smoothing_mm, mm_per_px
+        ).astype(bool)
+        group_map = group_map.copy()
+        group_map[protected_bg_mask] = -1
+
     # V8.1: eliminate tiny wrong-color raster components BEFORE vectorization.
     # A component can only move to a stable color sharing a real 4-neighbor
     # pixel edge, and the strongest surrounding edge count wins.
@@ -993,13 +1403,10 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
         master_mask, mm_per_px, simplify_mm, contour_mode
     )
 
-    # Explicit background remains a real hole/background region.
-    if explicit_background_mask is not None and np.any(explicit_background_mask):
-        smooth_bg_mask = _smooth_binary_mask(
-            explicit_background_mask, edge_smoothing_mm, mm_per_px
-        )
+    # Explicit background remains a hard protected hole/background region.
+    if np.any(protected_bg_mask):
         bg_geom = contour_to_polygons(
-            smooth_bg_mask,
+            protected_bg_mask,
             mm_per_px,
             simplify_mm,
             contour_mode,
@@ -1062,6 +1469,7 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
                     partition=partition,
                     raw=raw,
                     simplify_mm=simplify_mm,
+                    protected_background_mask=protected_bg_mask,
                 )
                 if owner is None:
                     next_pending.append(gap)
@@ -1076,22 +1484,57 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
                     else []
                 )
                 pieces.extend(gaps)
-                merged = unary_union(pieces).buffer(0)
+                merged = unary_union(pieces).intersection(total).buffer(0)
                 if not merged.is_empty:
                     partition[owner] = merged
 
             pending_gaps = next_pending
 
-        # Never invent a remote color to maintain a mathematically exact fill.
-        # If a meaningful gap somehow has no local neighbor, report it instead.
-        unresolved_area = float(sum(g.area for g in pending_gaps))
-        if unresolved_area > 1e-9:
-            raise RuntimeError(
-                "Local partitioning found a vectorization gap of "
-                f"{unresolved_area:.8f} mm² with no physically adjacent print "
-                "color. The gap was not assigned to a random/remote color. "
-                "Try a higher Geometry Resolution or lower Contour Simplification."
-            )
+        # V8.3 must never abort solely because contour simplification produced
+        # a gap. `_choose_local_gap_owner` already has a deterministic emergency
+        # fallback, but keep an additional one-group fallback here for safety.
+        if pending_gaps:
+            fallback_names = [
+                name for name in names
+                if (
+                    partition.get(name) is not None
+                    and not partition.get(name).is_empty
+                )
+                or (raw.get(name) is not None and not raw.get(name).is_empty)
+            ]
+            if not fallback_names:
+                fallback_names = list(names)
+
+            for gap in pending_gaps:
+                owner = _choose_local_gap_owner(
+                    gap=gap,
+                    names=names,
+                    group_map=group_map,
+                    mm_per_px=mm_per_px,
+                    partition=partition,
+                    raw=raw,
+                    simplify_mm=simplify_mm,
+                    protected_background_mask=protected_bg_mask,
+                )
+                if owner is None and fallback_names:
+                    owner = fallback_names[0]
+                if owner is None:
+                    continue
+
+                safe_gap = gap.intersection(total).buffer(0)
+                if safe_gap.is_empty:
+                    continue
+
+                existing = partition.get(owner)
+                pieces = (
+                    [existing]
+                    if existing is not None and not existing.is_empty
+                    else []
+                )
+                pieces.append(safe_gap)
+                partition[owner] = unary_union(pieces).intersection(total).buffer(0)
+
+            pending_gaps = []
 
     # Numerical safety net. This should normally be effectively zero area.
     union_partition = unary_union(
@@ -1110,6 +1553,7 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
                 partition=partition,
                 raw=raw,
                 simplify_mm=simplify_mm,
+                protected_background_mask=protected_bg_mask,
             )
             if owner is None:
                 unresolved.append(gap)
@@ -1119,13 +1563,41 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
                 [g for g in (existing, gap) if g is not None and not g.is_empty]
             ).buffer(0)
 
-        unresolved_area = float(sum(g.area for g in unresolved))
-        if unresolved_area > 1e-9:
-            raise RuntimeError(
-                "Final partition contains "
-                f"{unresolved_area:.8f} mm² that has no local adjacent print "
-                "color. V8.1 refuses to assign that area globally."
-            )
+        if unresolved:
+            fallback_names = [
+                name for name in names
+                if partition.get(name) is not None and not partition.get(name).is_empty
+            ]
+            if not fallback_names:
+                fallback_names = list(names)
+
+            for gap in unresolved:
+                owner = _choose_local_gap_owner(
+                    gap=gap,
+                    names=names,
+                    group_map=group_map,
+                    mm_per_px=mm_per_px,
+                    partition=partition,
+                    raw=raw,
+                    simplify_mm=simplify_mm,
+                    protected_background_mask=protected_bg_mask,
+                )
+                if owner is None and fallback_names:
+                    owner = fallback_names[0]
+                if owner is None:
+                    continue
+
+                safe_gap = gap.intersection(total).buffer(0)
+                if safe_gap.is_empty:
+                    continue
+
+                existing = partition.get(owner)
+                partition[owner] = unary_union(
+                    [
+                        g for g in (existing, safe_gap)
+                        if g is not None and not g.is_empty
+                    ]
+                ).intersection(total).buffer(0)
 
     # Remove tiny embedded wrong-color specks according to Min. Island Area,
     # while transferring their exact geometry to the surrounding stable color.
@@ -1136,6 +1608,20 @@ def make_exact_partition(label_img: np.ndarray, groups: dict, mm_per_px: float,
         min_area_mm2=min_area_mm2,
         mm_per_px=mm_per_px,
         simplify_mm=simplify_mm,
+    )
+
+    # Final validity + exact-partition normalization. This repairs rare
+    # self-intersections created by aggressive smoothing/simplification and then
+    # reconstructs an overlap-free partition inside the BG-protected `total`.
+    partition, total = _normalize_exact_partition_geometry(
+        partition=partition,
+        total=total,
+        names=names,
+        group_map=group_map,
+        mm_per_px=mm_per_px,
+        raw=raw,
+        simplify_mm=simplify_mm,
+        protected_background_mask=protected_bg_mask,
     )
 
     # Preserve original UI/group order.
@@ -1929,6 +2415,78 @@ def _active_content_bbox_px(label_img: np.ndarray, groups: dict):
     return x0, y0, x1, y1, (x1 - x0 + 1), (y1 - y0 + 1)
 
 
+def _normalize_scaled_partition_geometry(geoms: dict, total):
+    """Repair numerical self-intersections after non-uniform physical scaling.
+
+    Shapely affine scaling can expose near-coincident ring precision issues in
+    complex MultiPolygons, especially when Width and Height are scaled
+    independently. This repair works entirely inside the already BG-protected
+    fitted `total`, so it cannot restore background holes.
+    """
+    total = _make_valid_polygonal(total)
+    if total is None or total.is_empty:
+        return {}, total
+
+    repaired = {}
+    for name, geom in geoms.items():
+        if geom is None or geom.is_empty:
+            continue
+        geom = _make_valid_polygonal(geom)
+        if geom.is_empty:
+            continue
+        geom = _make_valid_polygonal(geom.intersection(total))
+        if not geom.is_empty:
+            repaired[name] = geom
+
+    if not repaired:
+        return {}, total
+
+    # Recreate an overlap-free partition, keeping smaller/detail regions first.
+    ordered = sorted(repaired, key=lambda n: float(repaired[n].area))
+    remaining = total
+    exact = {}
+
+    for name in ordered:
+        piece = _make_valid_polygonal(repaired[name].intersection(remaining))
+        if piece.is_empty:
+            continue
+        exact[name] = piece
+        remaining = _make_valid_polygonal(remaining.difference(piece))
+
+    # Validity repair can theoretically remove tiny slivers. Fill those with the
+    # physically nearest existing fitted color instead of leaving a gap.
+    for gap in [
+        g for g in iter_polygons(remaining)
+        if g is not None and not g.is_empty and float(g.area) > 1e-12
+    ]:
+        nearest = []
+        for name, geom in exact.items():
+            if geom is None or geom.is_empty:
+                continue
+            try:
+                nearest.append((float(gap.distance(geom)), name))
+            except Exception:
+                pass
+
+        if not nearest:
+            continue
+
+        nearest.sort(key=lambda item: (item[0], item[1]))
+        owner = nearest[0][1]
+        existing = exact.get(owner)
+        exact[owner] = _make_valid_polygonal(
+            unary_union([existing, gap]).intersection(total)
+        )
+
+    final = {}
+    for name, geom in exact.items():
+        geom = _make_valid_polygonal(geom.intersection(total))
+        if not geom.is_empty:
+            final[name] = geom
+
+    return final, total
+
+
 def _fit_partition_to_requested_size(
     geoms: dict,
     total,
@@ -1974,7 +2532,12 @@ def _fit_partition_to_requested_size(
     }
     fitted_total = scale_geom(total, xfact=sx, yfact=sy, origin=origin)
 
-    # Normalize tiny floating-point drift so the bounds start at the same origin.
+    # Non-uniform scaling can expose tiny ring self-intersections in complex
+    # MultiPolygons. Repair and rebuild the exact partition inside fitted_total.
+    fitted_geoms, fitted_total = _normalize_scaled_partition_geometry(
+        fitted_geoms, fitted_total
+    )
+
     return fitted_geoms, fitted_total
 
 

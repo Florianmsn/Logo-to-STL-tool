@@ -21,7 +21,7 @@ except ImportError:
     from logo_inlay_core import closest_color_name as guess_color_name
 
 
-APP_TITLE = "Logo to STL Tool 8.2"
+APP_TITLE = "Logo to STL Tool 8.3"
 MANUAL_AUTO_LABEL = -2147483000
 APP_DIR = Path.home() / ".logo_inlay_tool"
 SETTINGS_FILE = APP_DIR / "settings.json"
